@@ -74,11 +74,85 @@ Full 64-layer forward pass: M=1 = 7.4s, M=8 = 213ms (warm cache after M=1 run).
 
 4. **On the 64GB Pro**, all 27B weights stay resident (no page faults), giving 3.3ms/layer × 64 = 211ms per full MLP pass. With attention and norms, estimate ~400-500ms per token for the full model.
 
+## Post-Kill-Test Results
+
+### Full 64-Layer Forward Pass (27B on 16GB)
+
+75 tokens of coherent English from a 27B model on 16GB RAM.
+
+| Metric | Value |
+|--------|-------|
+| Forward pass (cold) | ~16.4s (SSD page fault limited) |
+| Forward pass (warm, MADV_WILLNEED) | ~7.5s (2x over cold) |
+| Generation rate (cold) | 0.066 tok/s |
+| Generation rate (warm) | 0.133 tok/s |
+| Pro estimate (weights resident) | 2.5-3 tok/s |
+
+### GDN (GatedDeltaNet) Decode — First in Metal
+
+48 of 64 layers use GatedDeltaNet (linear attention with persistent state). Verified against MLX reference:
+- 16/18 individual components PASS
+- out_proj at 85% (accumulated bf16 rounding)
+- Layer output recovers to 91%
+- Custom Metal kernels: `gated_delta_step`, `depthwise_conv1d_step`, `sigmoid_gate_bf16`, `silu_multiply_bf16`
+
+### Attention Layer Verification
+
+16 of 64 layers use full attention with RoPE + KV cache:
+- 14/14 components PASS
+- SDPA decode kernel verified against MLX reference
+
+### KV Cache Context Test
+
+Context carries across tokens:
+- "The capital of France is" → "Paris." (PASS)
+- "My name is Nick. What is my name?" → enters coherent reasoning mode
+
+### Warm-Path Prefetch (MADV_WILLNEED)
+
+Attempted 5 approaches to pre-load weights into Metal buffers. All OOM'd on 16GB (Metal shared buffers are swap-backed — write-before-evict steals pages from OS mmap cache). Solution: `MADV_WILLNEED` + `MADV_SEQUENTIAL` prefetch hints. Zero extra memory, 2x speedup.
+
+| Approach | Result |
+|----------|--------|
+| Full Metal buffer wire | OOM (13GB Metal + 14.4GB mmap) |
+| Budget wire (9.5GB) | OOM |
+| Single command buffer | OOM |
+| mmap-only (cold) | 0.066 tok/s (16.4s/token) |
+| mmap + MADV_WILLNEED | 0.133 tok/s (7.5s/token) — 2x improvement |
+
+**Key insight:** On memory-constrained hardware, mmap with prefetch hints beats pre-allocated Metal buffers. Metal shared buffers use anonymous swap (must write before evicting). mmap pages are file-backed (just re-read from SSD, no write needed).
+
+### GPU Page Fault Finding
+
+Zero-copy GPU access to mmap'd safetensors via `makeBuffer(bytesNoCopy:)` causes catastrophic page faults:
+
+| Method | Time | Notes |
+|--------|------|-------|
+| Zero-copy (bytesNoCopy) | 65ms | GPU page faults stall entire pipeline |
+| memcpy (bytes:) | 6.5ms | 10x faster than zero-copy |
+| mx.load (Python) | 6.6ms | Header parsing + materialization |
+| Page-aligned zero-copy | 0.065ms | Correct approach: aligned spans |
+
+The counterintuitive result: zero-copy is 10x WORSE than copying. GPU page faults (from non-resident mmap pages) stall the command buffer. Solution: pre-fault pages with MADV_WILLNEED before GPU access, or use page-aligned `bytesNoCopy` on already-resident data.
+
+### Bugs Found
+
+1. **Double-processing of last prefill token** — re-ran final prefill token during generation start, corrupting GDN conv1d state and applying delta update twice
+2. **Position off-by-one** — first generated token's KV stored at position N-1 instead of N
+3. **EOS token mismatch** — checking Qwen2 token IDs (151643/151645) instead of Qwen3.5 (248046/248044)
+
 ## Files
 
 | File | Purpose |
 |------|---------|
+| `full_forward.swift` | Complete 64-layer forward pass with autoregressive generation |
+| `warm_forward.swift` | MADV_WILLNEED prefetch path (2x over cold) |
+| `test_context.swift` | KV cache context verification |
+| `attn_forward.swift` | Attention layer verification (14/14 PASS) |
+| `gdn_forward.swift` | GDN layer verification (16/18 PASS) |
+| `tokenize_prompt.py` | Chat template + tokenizer for warm_forward |
 | `weight_loader.swift` | Step 1: mmap + zero-copy weight loading |
+| `weight_loader_aligned.swift` | Step 1b: page-aligned zero-copy (0.065ms) |
 | `kernel_dispatch.swift` | Step 2: single kernel dispatch + verification |
 | `mlp_pipeline.swift` | Step 3: 4-kernel MLP pipeline + 32-layer benchmark |
 | `streaming_27b.swift` | Step 4: 27B streaming from mmap'd safetensors |

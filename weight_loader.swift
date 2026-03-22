@@ -6,7 +6,7 @@
 // Compare against mx.load's 6.6ms from B4.
 //
 // Gate: Metal buffer fill < 3ms → IAM architecture is viable.
-//       Metal buffer fill >= 3ms → IAM is Pro-only, pivot to SCGP hardening.
+//       Metal buffer fill >= 3ms → IAM is Pro-only, pivot to extraction hardening.
 
 import Foundation
 import Metal
@@ -275,7 +275,7 @@ print("GATE: Metal buffer fill \(String(format: "%.3f", gatherMean)) ms \(gatePa
 if gatePass {
     print("IAM architecture is VIABLE. Proceed to Step 2.")
 } else {
-    print("IAM is Pro-only. Pivot to SCGP hardening.")
+    print("IAM is Pro-only. Pivot to extraction hardening.")
 }
 
 // Cleanup

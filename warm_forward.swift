@@ -2,16 +2,11 @@
 // Pre-loads ALL 64 transformer layers + lm_head into Metal shared buffers at startup.
 // Eliminates per-token SSD page faults that caused 14-16s/token in the cold path.
 //
-// Memory budget (16GB M5 Air):
-//   64 layers: ~13,068 MB (48 GDN @ 205.7 MB + 16 Attn @ 199.7 MB)
-//   lm_head:   ~682 MB
-//   GDN state: ~149 MB (conv + delta)
-//   KV cache:  ~64 MB (16 layers x 1024 tokens)
-//   Activations: ~100 MB
-//   Total:     ~14,063 MB → fits in 16GB with ~1.5GB for OS
-//
-//   Embedding (682 MB) is NOT pre-loaded during decode.
-//   Instead: targeted 10KB memcpy per token from mmap (token_id * row_size).
+// FINDINGS on 16GB M5 Air:
+// - Model is 14.4GB, OS needs ~4.6GB → can't fit all weights in RAM
+// - Pre-loading into Metal buffers causes swap thrashing (WORSE than mmap)
+// - Best strategy: mmap with MADV_WILLNEED prefetch + double-buffered layer loading
+// - Overlap CPU weight loading with GPU compute via async command buffers
 //
 // Build: swiftc -O -framework Metal -framework MetalPerformanceShaders warm_forward.swift -o warm_forward
 // Run:   ./warm_forward
@@ -52,7 +47,6 @@ let GDN_KV_REPEAT: Int = 3
 let GDN_INV_SCALE: Float = 0.08838834764  // 1/sqrt(128)
 let GDN_STATE_SIZE: Int = 48 * 128 * 128
 
-// Layer type: every 4th layer (3, 7, 11, ..., 63) is full attention
 let FULL_ATTN_INTERVAL: Int = 4
 
 func isFullAttn(_ layerIdx: Int) -> Bool {
@@ -120,31 +114,6 @@ kernel void residual_add_bf16(
     out[tid] = bfloat(float(a[tid]) + float(b[tid]));
 }
 
-kernel void embed_lookup_bf16(
-    device const uint* weight    [[buffer(0)]],
-    device const bfloat* scales  [[buffer(1)]],
-    device const bfloat* biases  [[buffer(2)]],
-    device bfloat* out           [[buffer(3)]],
-    constant uint& token_id      [[buffer(4)]],
-    constant uint& hidden_dim    [[buffer(5)]],
-    constant uint& group_sz      [[buffer(6)]],
-    uint tid [[thread_position_in_grid]])
-{
-    if (tid >= hidden_dim) return;
-    uint packed_dim = hidden_dim / 8;
-    uint groups_per_row = hidden_dim / group_sz;
-    uint pack_idx = tid / 8;
-    uint nibble_idx = tid % 8;
-    uint packed_val = weight[token_id * packed_dim + pack_idx];
-    uint nibble = (packed_val >> (nibble_idx * 4)) & 0xF;
-    uint group_idx = tid / group_sz;
-    float scale = float(scales[token_id * groups_per_row + group_idx]);
-    float bias = float(biases[token_id * groups_per_row + group_idx]);
-    out[tid] = bfloat(float(nibble) * scale + bias);
-}
-
-// CPU-side embedding lookup for warm path (writes bf16 directly)
-// This kernel dequantizes a single row from small buffers holding just one row
 kernel void embed_lookup_row_bf16(
     device const uint* weight_row   [[buffer(0)]],
     device const bfloat* scale_row  [[buffer(1)]],
@@ -415,7 +384,6 @@ kernel void rms_norm_gated_bf16(
     out[base + elem] = bfloat(silu_z * x_normed);
 }
 
-// Copy bf16 buffer (for KV cache append)
 kernel void copy_bf16(
     device const bfloat* src [[buffer(0)]],
     device bfloat* dst       [[buffer(1)]],
@@ -426,7 +394,6 @@ kernel void copy_bf16(
     dst[tid] = src[tid];
 }
 
-// Scaled dot-product attention for M=1 decode with KV cache
 kernel void sdpa_decode_bf16(
     device const bfloat* q        [[buffer(0)]],
     device const bfloat* k_cache  [[buffer(1)]],
@@ -440,11 +407,9 @@ kernel void sdpa_decode_bf16(
 {
     uint h = tid;
     if (h >= num_heads) return;
-
     uint kv_h = h / (num_heads / num_kv_heads);
     float scale = 1.0f / sqrt(float(head_dim));
     uint kv_stride = num_kv_heads * head_dim;
-
     float scores[1024];
     float max_s = -1e30f;
     for (uint t = 0; t < seq_len && t < 1024; t++) {
@@ -457,13 +422,11 @@ kernel void sdpa_decode_bf16(
         scores[t] = s;
         if (s > max_s) max_s = s;
     }
-
     float sum_exp = 0.0f;
     for (uint t = 0; t < seq_len && t < 1024; t++) {
         scores[t] = exp(scores[t] - max_s);
         sum_exp += scores[t];
     }
-
     for (uint d = 0; d < head_dim; d++) {
         float v = 0.0f;
         for (uint t = 0; t < seq_len && t < 1024; t++) {
@@ -545,7 +508,6 @@ let queue = device.makeCommandQueue()!
 print("Device: \(device.name)")
 print("Max buffer: \(device.maxBufferLength / 1024 / 1024) MB")
 
-// Load metallib (NAX kernel)
 let mlxMetalPath = String(cString: getenv("HOME")) +
     "/.mlx-env/lib/python3.11/site-packages/mlx/lib/mlx.metallib"
 guard let mlxLib = try? device.makeLibrary(URL: URL(fileURLWithPath: mlxMetalPath)) else {
@@ -557,7 +519,6 @@ guard let naxFn = try? mlxLib.makeFunction(name: naxKernelName) else {
 }
 let naxPSO = try! device.makeComputePipelineState(function: naxFn)
 
-// Custom kernels
 let customLib = try! device.makeLibrary(source: metalSource, options: nil)
 func makePSO(_ name: String) -> MTLComputePipelineState {
     let fn = customLib.makeFunction(name: name)!
@@ -566,7 +527,6 @@ func makePSO(_ name: String) -> MTLComputePipelineState {
 let rmsNormPSO = makePSO("rms_norm_bf16")
 let siluMulPSO = makePSO("silu_multiply_bf16")
 let residualPSO = makePSO("residual_add_bf16")
-let embedPSO = makePSO("embed_lookup_bf16")
 let embedRowPSO = makePSO("embed_lookup_row_bf16")
 let sigmoidMulPSO = makePSO("sigmoid_multiply_bf16")
 let ropePSO = makePSO("rope_bf16")
@@ -596,6 +556,7 @@ let layersInfo = index["layers"] as! [[String: Any]]
 
 var mmaps: [UnsafeRawPointer] = []
 var mmapSizes: [Int] = []
+var mmapMut: [UnsafeMutableRawPointer] = []  // for madvise
 for path in shardFiles {
     let fd = open(path, O_RDONLY)
     guard fd >= 0 else { print("Cannot open \(path)"); exit(1) }
@@ -604,12 +565,15 @@ for path in shardFiles {
     let ptr = mmap(nil, size, PROT_READ, MAP_PRIVATE, fd, 0)!
     close(fd)
     mmaps.append(UnsafeRawPointer(ptr))
+    mmapMut.append(ptr)
     mmapSizes.append(size)
+    // Set sequential readahead hint for all shards
+    madvise(ptr, size, MADV_SEQUENTIAL)
 }
-print("mmap'd \(shardFiles.count) shard files")
+print("mmap'd \(shardFiles.count) shard files (MADV_SEQUENTIAL)")
 
 // ============================================================================
-// MARK: - Embedding: mmap pointers for targeted row lookup (no full load)
+// MARK: - Embedding: targeted row lookup from mmap
 // ============================================================================
 
 let embedInfo = index["embed_tokens"] as! [String: Any]
@@ -617,170 +581,79 @@ let embedWeightInfo = parseTensorInfo(embedInfo["weight"] as! [String: Any])
 let embedScalesInfo = parseTensorInfo(embedInfo["scales"] as! [String: Any])
 let embedBiasesInfo = parseTensorInfo(embedInfo["biases"] as! [String: Any])
 
-// Row sizes for targeted lookup
-let embedPackedDim = HIDDEN_SIZE / 8  // 640 uint32s per row
-let embedWeightRowBytes = embedPackedDim * 4  // 2560 bytes
-let embedGroupsPerRow = HIDDEN_SIZE / GROUP_SIZE  // 80 groups per row
-let embedScaleRowBytes = embedGroupsPerRow * 2  // 160 bytes (bf16)
-let embedBiasRowBytes = embedGroupsPerRow * 2   // 160 bytes (bf16)
-let embedTotalRowBytes = embedWeightRowBytes + embedScaleRowBytes + embedBiasRowBytes  // 2880 bytes
+let embedPackedDim = HIDDEN_SIZE / 8
+let embedWeightRowBytes = embedPackedDim * 4
+let embedGroupsPerRow = HIDDEN_SIZE / GROUP_SIZE
+let embedScaleRowBytes = embedGroupsPerRow * 2
+let embedBiasRowBytes = embedGroupsPerRow * 2
 
-// Small Metal buffers for single-row embedding lookup during decode
 let embedRowWBuf = device.makeBuffer(length: embedWeightRowBytes, options: .storageModeShared)!
 let embedRowSBuf = device.makeBuffer(length: embedScaleRowBytes, options: .storageModeShared)!
 let embedRowBBuf = device.makeBuffer(length: embedBiasRowBytes, options: .storageModeShared)!
 
-print("\nEmbedding: targeted row lookup (\(embedTotalRowBytes) bytes/token, NOT pre-loaded)")
+print("Embedding: targeted row lookup (~3 KB/token)")
 
-// Final norm (tiny, always loaded)
 let finalNormInfo = index["final_norm"] as! [String: Any]
 let finalNormW = loadTensorToBuffer(device, mmaps, parseTensorInfo(finalNormInfo["weight"] as! [String: Any]))
-print("Final norm: \(finalNormW.length / 1024) KB")
 
 // ============================================================================
-// MARK: - WARM PATH: Pre-load ALL 64 layers + lm_head
+// MARK: - Pre-compute tensor info for all layers (no allocation, just metadata)
 // ============================================================================
 
-// Memory budget: leave ~2.5GB for OS + GDN state (149MB) + KV cache (64MB) + activations (100MB)
-// On 16GB: 16384 - 2500 - 149 - 64 - 100 = 13571 MB available for weights
-// But Metal overhead and fragmentation eat ~500MB more, so budget 12800 MB for layers
-// lm_head is streamed (682MB saved), embed is row-lookup (682MB saved)
-let WEIGHT_BUDGET_MB: Int = 12800  // Conservative: leaves ~3.2GB for everything else
-
-print("\n" + String(repeating: "=", count: 60))
-print("WARM PATH: Pre-loading weights into Metal buffers")
-print("Budget: \(WEIGHT_BUDGET_MB) MB for layer weights")
-print(String(repeating: "=", count: 60))
-let tWarmStart = CFAbsoluteTimeGetCurrent()
-
-// Pre-allocated weight arrays indexed by layer position
-var warmAttnLayers: [Int: AttnLayerWeights] = [:]
-var warmGDNLayers: [Int: GDNLayerWeights] = [:]
-
-var totalWiredBytes: Int = 0
-var wiredLayerCount: Int = 0
-var lastWiredLayer: Int = -1
-
-for layerIdx in 0..<NUM_LAYERS {
-    // Check budget before loading
-    let li = layersInfo[layerIdx]
-    let tensors = li["tensors"] as! [String: Any]
-    var layerBytes = 0
-    for (_, v) in tensors {
-        let d = v as! [String: Any]
-        layerBytes += d["byte_size"] as! Int
-    }
-    if (totalWiredBytes + layerBytes) / 1024 / 1024 > WEIGHT_BUDGET_MB {
-        print("  Budget limit reached at layer \(layerIdx) " +
-              "(\(totalWiredBytes / 1024 / 1024) MB wired, " +
-              "\(layerBytes / 1024 / 1024) MB needed)")
-        break
-    }
-    let tLayer = CFAbsoluteTimeGetCurrent()
-
-    func loadT(_ name: String) -> MTLBuffer {
-        let info = parseTensorInfo(tensors[name] as! [String: Any])
-        totalWiredBytes += info.byteSize
-        return loadTensorToBuffer(device, mmaps, info)
-    }
-
-    if isFullAttn(layerIdx) {
-        var lw = AttnLayerWeights()
-        lw.inputNormWeight = loadT("input_layernorm.weight")
-        lw.qProjW = loadT("self_attn.q_proj.weight")
-        lw.qProjS = loadT("self_attn.q_proj.scales")
-        lw.qProjB = loadT("self_attn.q_proj.biases")
-        lw.kProjW = loadT("self_attn.k_proj.weight")
-        lw.kProjS = loadT("self_attn.k_proj.scales")
-        lw.kProjB = loadT("self_attn.k_proj.biases")
-        lw.vProjW = loadT("self_attn.v_proj.weight")
-        lw.vProjS = loadT("self_attn.v_proj.scales")
-        lw.vProjB = loadT("self_attn.v_proj.biases")
-        lw.oProjW = loadT("self_attn.o_proj.weight")
-        lw.oProjS = loadT("self_attn.o_proj.scales")
-        lw.oProjB = loadT("self_attn.o_proj.biases")
-        lw.qNormWeight = loadT("self_attn.q_norm.weight")
-        lw.kNormWeight = loadT("self_attn.k_norm.weight")
-        lw.postNormWeight = loadT("post_attention_layernorm.weight")
-        lw.gateProjW = loadT("mlp.gate_proj.weight")
-        lw.gateProjS = loadT("mlp.gate_proj.scales")
-        lw.gateProjB = loadT("mlp.gate_proj.biases")
-        lw.upProjW = loadT("mlp.up_proj.weight")
-        lw.upProjS = loadT("mlp.up_proj.scales")
-        lw.upProjB = loadT("mlp.up_proj.biases")
-        lw.downProjW = loadT("mlp.down_proj.weight")
-        lw.downProjS = loadT("mlp.down_proj.scales")
-        lw.downProjB = loadT("mlp.down_proj.biases")
-        warmAttnLayers[layerIdx] = lw
-    } else {
-        var lw = GDNLayerWeights()
-        lw.inputNormWeight = loadT("input_layernorm.weight")
-        lw.qkvProjW = loadT("linear_attn.in_proj_qkv.weight")
-        lw.qkvProjS = loadT("linear_attn.in_proj_qkv.scales")
-        lw.qkvProjB = loadT("linear_attn.in_proj_qkv.biases")
-        lw.zProjW = loadT("linear_attn.in_proj_z.weight")
-        lw.zProjS = loadT("linear_attn.in_proj_z.scales")
-        lw.zProjB = loadT("linear_attn.in_proj_z.biases")
-        lw.bProjW = loadT("linear_attn.in_proj_b.weight")
-        lw.bProjS = loadT("linear_attn.in_proj_b.scales")
-        lw.bProjB = loadT("linear_attn.in_proj_b.biases")
-        lw.aProjW = loadT("linear_attn.in_proj_a.weight")
-        lw.aProjS = loadT("linear_attn.in_proj_a.scales")
-        lw.aProjB = loadT("linear_attn.in_proj_a.biases")
-        lw.convWeight = loadT("linear_attn.conv1d.weight")
-        lw.ALog = loadT("linear_attn.A_log")
-        lw.dtBias = loadT("linear_attn.dt_bias")
-        lw.normWeight = loadT("linear_attn.norm.weight")
-        lw.outProjW = loadT("linear_attn.out_proj.weight")
-        lw.outProjS = loadT("linear_attn.out_proj.scales")
-        lw.outProjB = loadT("linear_attn.out_proj.biases")
-        lw.postNormWeight = loadT("post_attention_layernorm.weight")
-        lw.gateProjW = loadT("mlp.gate_proj.weight")
-        lw.gateProjS = loadT("mlp.gate_proj.scales")
-        lw.gateProjB = loadT("mlp.gate_proj.biases")
-        lw.upProjW = loadT("mlp.up_proj.weight")
-        lw.upProjS = loadT("mlp.up_proj.scales")
-        lw.upProjB = loadT("mlp.up_proj.biases")
-        lw.downProjW = loadT("mlp.down_proj.weight")
-        lw.downProjS = loadT("mlp.down_proj.scales")
-        lw.downProjB = loadT("mlp.down_proj.biases")
-        warmGDNLayers[layerIdx] = lw
-    }
-
-    wiredLayerCount += 1
-    lastWiredLayer = layerIdx
-
-    let layerMs = (CFAbsoluteTimeGetCurrent() - tLayer) * 1000
-    let layerType = isFullAttn(layerIdx) ? "ATTN" : "GDN"
-    let wiredMB = totalWiredBytes / 1024 / 1024
-    if layerIdx < 3 || layerIdx == NUM_LAYERS - 1 || layerIdx % 16 == 0 {
-        print("  Layer \(String(format: "%2d", layerIdx)) [\(layerType)]: " +
-              "\(String(format: "%.0f", layerMs))ms  " +
-              "(cumulative: \(wiredMB) MB)")
-    } else if layerIdx == 3 {
-        print("  ...")
-    }
+struct LayerTensorInfos {
+    let layerIdx: Int
+    let isAttn: Bool
+    let tensors: [String: TensorInfo]
+    let totalBytes: Int
 }
 
-// lm_head: stream from mmap (saves 682MB — critical on 16GB)
+var layerInfos: [LayerTensorInfos] = []
+for layerIdx in 0..<NUM_LAYERS {
+    let li = layersInfo[layerIdx]
+    let tensors = li["tensors"] as! [String: Any]
+    var infos: [String: TensorInfo] = [:]
+    var totalBytes = 0
+    for (name, val) in tensors {
+        let info = parseTensorInfo(val as! [String: Any])
+        infos[name] = info
+        totalBytes += info.byteSize
+    }
+    layerInfos.append(LayerTensorInfos(
+        layerIdx: layerIdx,
+        isAttn: isFullAttn(layerIdx),
+        tensors: infos,
+        totalBytes: totalBytes))
+}
+
 let lmHeadInfo = index["lm_head"] as! [String: Any]
 let lmHeadWInfo = parseTensorInfo(lmHeadInfo["weight"] as! [String: Any])
 let lmHeadSInfo = parseTensorInfo(lmHeadInfo["scales"] as! [String: Any])
 let lmHeadBInfo = parseTensorInfo(lmHeadInfo["biases"] as! [String: Any])
-print("  lm_head: streamed from mmap (682 MB saved)")
 
-let tWarmTotal = CFAbsoluteTimeGetCurrent() - tWarmStart
-let coldLayerCount = NUM_LAYERS - wiredLayerCount
-print("\nWarm wiring complete:")
-print("  Total wired: \(totalWiredBytes / 1024 / 1024) MB")
-print("  Time: \(String(format: "%.1f", tWarmTotal))s")
-print("  Warm layers: \(wiredLayerCount)/\(NUM_LAYERS) (0-\(lastWiredLayer))")
-print("  Cold layers: \(coldLayerCount) (\(lastWiredLayer+1)-\(NUM_LAYERS-1)) — streamed from mmap")
-print("  lm_head: streamed from mmap (682 MB saved)")
-print("  embed: row lookup from mmap (682 MB saved)")
+// ============================================================================
+// MARK: - Prefetch helper: advise kernel to pre-load pages
+// ============================================================================
 
-// Cold-path layer loading (same as full_forward.swift)
-func loadAttnLayerCold(_ layerIdx: Int) -> AttnLayerWeights {
+func prefetchLayer(_ layerIdx: Int) {
+    let info = layerInfos[layerIdx]
+    for (_, tensorInfo) in info.tensors {
+        let ptr = mmapMut[tensorInfo.fileIdx] + tensorInfo.byteOffset
+        madvise(ptr, tensorInfo.byteSize, MADV_WILLNEED)
+    }
+}
+
+func prefetchLmHead() {
+    for info in [lmHeadWInfo, lmHeadSInfo, lmHeadBInfo] {
+        let ptr = mmapMut[info.fileIdx] + info.byteOffset
+        madvise(ptr, info.byteSize, MADV_WILLNEED)
+    }
+}
+
+// ============================================================================
+// MARK: - Layer Loading Functions
+// ============================================================================
+
+func loadAttnLayer(_ layerIdx: Int) -> AttnLayerWeights {
     let li = layersInfo[layerIdx]
     let tensors = li["tensors"] as! [String: Any]
     func loadT(_ name: String) -> MTLBuffer {
@@ -815,7 +688,7 @@ func loadAttnLayerCold(_ layerIdx: Int) -> AttnLayerWeights {
     return lw
 }
 
-func loadGDNLayerCold(_ layerIdx: Int) -> GDNLayerWeights {
+func loadGDNLayer(_ layerIdx: Int) -> GDNLayerWeights {
     let li = layersInfo[layerIdx]
     let tensors = li["tensors"] as! [String: Any]
     func loadT(_ name: String) -> MTLBuffer {
@@ -856,13 +729,6 @@ func loadGDNLayerCold(_ layerIdx: Int) -> GDNLayerWeights {
 }
 
 // ============================================================================
-// MARK: - Unmap safetensors (free virtual address space, weights are in Metal buffers now)
-// ============================================================================
-// We keep mmaps alive for embedding row lookups during decode.
-// The mmap pages for layer weights should be evicted from RAM since Metal buffers
-// now hold copies. The OS will reclaim those pages under memory pressure.
-
-// ============================================================================
 // MARK: - Activation Buffers
 // ============================================================================
 
@@ -870,7 +736,6 @@ let hiddenBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageMode
 let normedBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageModeShared)!
 let residualBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageModeShared)!
 
-// Full attention buffers
 let qBuf = device.makeBuffer(length: NUM_HEADS * HEAD_DIM * 2 * 2, options: .storageModeShared)!
 let queriesBuf = device.makeBuffer(length: NUM_HEADS * HEAD_DIM * 2, options: .storageModeShared)!
 let attnGateBuf = device.makeBuffer(length: NUM_HEADS * HEAD_DIM * 2, options: .storageModeShared)!
@@ -882,7 +747,6 @@ let attnOutBuf = device.makeBuffer(length: NUM_HEADS * HEAD_DIM * 2, options: .s
 let gatedBuf = device.makeBuffer(length: NUM_HEADS * HEAD_DIM * 2, options: .storageModeShared)!
 let oOutBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageModeShared)!
 
-// GDN buffers
 let qkvBuf = device.makeBuffer(length: GDN_CONV_DIM * 2, options: .storageModeShared)!
 let zBuf = device.makeBuffer(length: GDN_VALUE_DIM * 2, options: .storageModeShared)!
 let aBuf = device.makeBuffer(length: GDN_NUM_V_HEADS * 2, options: .storageModeShared)!
@@ -899,22 +763,19 @@ let gdnYBuf = device.makeBuffer(length: GDN_VALUE_DIM * 2, options: .storageMode
 let gdnNormedBuf = device.makeBuffer(length: GDN_VALUE_DIM * 2, options: .storageModeShared)!
 let gdnOutProjBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageModeShared)!
 
-// MLP buffers (shared between attn and GDN layers)
 let gateProjBuf = device.makeBuffer(length: INTERMEDIATE_SIZE * 2, options: .storageModeShared)!
 let upProjBuf = device.makeBuffer(length: INTERMEDIATE_SIZE * 2, options: .storageModeShared)!
 let mlpHiddenBuf = device.makeBuffer(length: INTERMEDIATE_SIZE * 2, options: .storageModeShared)!
 let downProjBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageModeShared)!
 
-// Logits + argmax
 let logitsBuf = device.makeBuffer(length: VOCAB_SIZE * 2, options: .storageModeShared)!
 let argmaxBuf = device.makeBuffer(length: 4, options: .storageModeShared)!
 
-// RoPE cache
 let ropeCosBuf = device.makeBuffer(length: ROTARY_DIM / 2 * 4, options: .storageModeShared)!
 let ropeSinBuf = device.makeBuffer(length: ROTARY_DIM / 2 * 4, options: .storageModeShared)!
 
 // ============================================================================
-// MARK: - GDN Persistent State (48 layers)
+// MARK: - GDN Persistent State
 // ============================================================================
 
 let convStateBytes = (GDN_CONV_KERNEL - 1) * GDN_CONV_DIM * 2
@@ -928,30 +789,18 @@ let deltaState = device.makeBuffer(length: deltaStateBytes * numGDNLayers, optio
 memset(convStateA.contents(), 0, convStateA.length)
 memset(convStateB.contents(), 0, convStateB.length)
 memset(deltaState.contents(), 0, deltaState.length)
-
-let stateMB = (convStateA.length * 2 + deltaState.length) / 1024 / 1024
-print("\nGDN state allocated: \(stateMB) MB (\(numGDNLayers) layers)")
+print("GDN state: \((convStateA.length * 2 + deltaState.length) / 1024 / 1024) MB")
 
 var gdnLayerIndex: [Int: Int] = [:]
 var gdnIdx = 0
-for i in 0..<NUM_LAYERS {
-    if !isFullAttn(i) {
-        gdnLayerIndex[i] = gdnIdx
-        gdnIdx += 1
-    }
-}
+for i in 0..<NUM_LAYERS { if !isFullAttn(i) { gdnLayerIndex[i] = gdnIdx; gdnIdx += 1 } }
 
 var attnLayerIndex: [Int: Int] = [:]
 var attnIdx = 0
-for i in 0..<NUM_LAYERS {
-    if isFullAttn(i) {
-        attnLayerIndex[i] = attnIdx
-        attnIdx += 1
-    }
-}
+for i in 0..<NUM_LAYERS { if isFullAttn(i) { attnLayerIndex[i] = attnIdx; attnIdx += 1 } }
 
 // ============================================================================
-// MARK: - KV Cache (16 attention layers)
+// MARK: - KV Cache
 // ============================================================================
 
 let MAX_SEQ: Int = 1024
@@ -963,10 +812,10 @@ let kCache = device.makeBuffer(length: kvLayerBytes * numAttnLayers, options: .s
 let vCache = device.makeBuffer(length: kvLayerBytes * numAttnLayers, options: .storageModeShared)!
 memset(kCache.contents(), 0, kCache.length)
 memset(vCache.contents(), 0, vCache.length)
-print("KV cache: \(kCache.length * 2 / 1024) KB (\(numAttnLayers) layers x \(MAX_SEQ) tokens)")
+print("KV cache: \(kCache.length * 2 / 1024) KB")
 
 // ============================================================================
-// MARK: - Helper: dispatch quantized matmul
+// MARK: - Helpers
 // ============================================================================
 
 func dispatchQMatmul(_ enc: MTLComputeCommandEncoder,
@@ -988,10 +837,6 @@ func dispatchQMatmul(_ enc: MTLComputeCommandEncoder,
         threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 2))
 }
 
-// ============================================================================
-// MARK: - Helper: RoPE precompute
-// ============================================================================
-
 func precomputeRoPE(position: Int) {
     let cosPtr = ropeCosBuf.contents().bindMemory(to: Float.self, capacity: ROTARY_DIM / 2)
     let sinPtr = ropeSinBuf.contents().bindMemory(to: Float.self, capacity: ROTARY_DIM / 2)
@@ -1003,32 +848,23 @@ func precomputeRoPE(position: Int) {
     }
 }
 
-// ============================================================================
-// MARK: - Helper: Targeted embedding lookup from mmap
-// ============================================================================
-
 func embedFromMmap(tokenId: Int) {
-    // Copy just one row of weight/scales/biases from mmap into small Metal buffers
     let wSrc = mmaps[embedWeightInfo.fileIdx] + embedWeightInfo.byteOffset + tokenId * embedWeightRowBytes
     let sSrc = mmaps[embedScalesInfo.fileIdx] + embedScalesInfo.byteOffset + tokenId * embedScaleRowBytes
     let bSrc = mmaps[embedBiasesInfo.fileIdx] + embedBiasesInfo.byteOffset + tokenId * embedBiasRowBytes
-
     memcpy(embedRowWBuf.contents(), wSrc, embedWeightRowBytes)
     memcpy(embedRowSBuf.contents(), sSrc, embedScaleRowBytes)
     memcpy(embedRowBBuf.contents(), bSrc, embedBiasRowBytes)
 }
 
 // ============================================================================
-// MARK: - Dispatch: Full Attention Layer (uses pre-wired weights)
+// MARK: - Dispatch: Attention Layer
 // ============================================================================
 
 func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
                        attnIdx: Int, position: Int) {
-    var dim = UInt32(HIDDEN_SIZE)
-    var eps = RMS_NORM_EPS
-    var count = UInt32(HIDDEN_SIZE)
+    var dim = UInt32(HIDDEN_SIZE); var eps = RMS_NORM_EPS; var count = UInt32(HIDDEN_SIZE)
 
-    // 1. Input RMS Norm
     enc.setComputePipelineState(rmsNormPSO)
     enc.setBuffer(hiddenBuf, offset: 0, index: 0)
     enc.setBuffer(lw.inputNormWeight!, offset: 0, index: 1)
@@ -1038,153 +874,105 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: 256, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 2. Q projection
     dispatchQMatmul(enc, lw.qProjW!, lw.qProjS!, lw.qProjB!,
-                    normedBuf, qBuf,
-                    K_dim: HIDDEN_SIZE, N_dim: NUM_HEADS * HEAD_DIM * 2, M_dim: 1)
+                    normedBuf, qBuf, K_dim: HIDDEN_SIZE, N_dim: NUM_HEADS * HEAD_DIM * 2, M_dim: 1)
 
-    // 2b. Split Q+gate
     enc.setComputePipelineState(splitQGatePSO)
     enc.setBuffer(qBuf, offset: 0, index: 0)
     enc.setBuffer(queriesBuf, offset: 0, index: 1)
     enc.setBuffer(attnGateBuf, offset: 0, index: 2)
-    var nh = UInt32(NUM_HEADS)
-    var hd = UInt32(HEAD_DIM)
-    enc.setBytes(&nh, length: 4, index: 3)
-    enc.setBytes(&hd, length: 4, index: 4)
+    var nh = UInt32(NUM_HEADS); var hd = UInt32(HEAD_DIM)
+    enc.setBytes(&nh, length: 4, index: 3); enc.setBytes(&hd, length: 4, index: 4)
     enc.dispatchThreads(MTLSize(width: HEAD_DIM, height: NUM_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 3. K projection
     dispatchQMatmul(enc, lw.kProjW!, lw.kProjS!, lw.kProjB!,
-                    normedBuf, kBuf,
-                    K_dim: HIDDEN_SIZE, N_dim: NUM_KV_HEADS * HEAD_DIM, M_dim: 1)
-
-    // 4. V projection
+                    normedBuf, kBuf, K_dim: HIDDEN_SIZE, N_dim: NUM_KV_HEADS * HEAD_DIM, M_dim: 1)
     dispatchQMatmul(enc, lw.vProjW!, lw.vProjS!, lw.vProjB!,
-                    normedBuf, vBuf,
-                    K_dim: HIDDEN_SIZE, N_dim: NUM_KV_HEADS * HEAD_DIM, M_dim: 1)
+                    normedBuf, vBuf, K_dim: HIDDEN_SIZE, N_dim: NUM_KV_HEADS * HEAD_DIM, M_dim: 1)
 
-    // 5. Per-head QK norm
     enc.setComputePipelineState(perHeadRmsNormPSO)
-    enc.setBuffer(queriesBuf, offset: 0, index: 0)
-    enc.setBuffer(lw.qNormWeight!, offset: 0, index: 1)
+    enc.setBuffer(queriesBuf, offset: 0, index: 0); enc.setBuffer(lw.qNormWeight!, offset: 0, index: 1)
     enc.setBuffer(qNormedBuf, offset: 0, index: 2)
-    enc.setBytes(&nh, length: 4, index: 3)
-    enc.setBytes(&hd, length: 4, index: 4)
-    enc.setBytes(&eps, length: 4, index: 5)
+    enc.setBytes(&nh, length: 4, index: 3); enc.setBytes(&hd, length: 4, index: 4); enc.setBytes(&eps, length: 4, index: 5)
     enc.dispatchThreads(MTLSize(width: HEAD_DIM, height: NUM_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: HEAD_DIM, height: 1, depth: 1))
 
     var nkv = UInt32(NUM_KV_HEADS)
-    enc.setBuffer(kBuf, offset: 0, index: 0)
-    enc.setBuffer(lw.kNormWeight!, offset: 0, index: 1)
+    enc.setBuffer(kBuf, offset: 0, index: 0); enc.setBuffer(lw.kNormWeight!, offset: 0, index: 1)
     enc.setBuffer(kNormedBuf, offset: 0, index: 2)
-    enc.setBytes(&nkv, length: 4, index: 3)
-    enc.setBytes(&hd, length: 4, index: 4)
-    enc.setBytes(&eps, length: 4, index: 5)
+    enc.setBytes(&nkv, length: 4, index: 3); enc.setBytes(&hd, length: 4, index: 4); enc.setBytes(&eps, length: 4, index: 5)
     enc.dispatchThreads(MTLSize(width: HEAD_DIM, height: NUM_KV_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: HEAD_DIM, height: 1, depth: 1))
 
-    // 6. RoPE
     enc.setComputePipelineState(ropePSO)
     enc.setBuffer(qNormedBuf, offset: 0, index: 0)
-    enc.setBuffer(ropeCosBuf, offset: 0, index: 1)
-    enc.setBuffer(ropeSinBuf, offset: 0, index: 2)
-    enc.setBytes(&nh, length: 4, index: 3)
-    enc.setBytes(&hd, length: 4, index: 4)
-    var rd = UInt32(ROTARY_DIM)
-    enc.setBytes(&rd, length: 4, index: 5)
+    enc.setBuffer(ropeCosBuf, offset: 0, index: 1); enc.setBuffer(ropeSinBuf, offset: 0, index: 2)
+    enc.setBytes(&nh, length: 4, index: 3); enc.setBytes(&hd, length: 4, index: 4)
+    var rd = UInt32(ROTARY_DIM); enc.setBytes(&rd, length: 4, index: 5)
     enc.dispatchThreads(MTLSize(width: ROTARY_DIM / 2, height: NUM_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-
-    enc.setBuffer(kNormedBuf, offset: 0, index: 0)
-    enc.setBytes(&nkv, length: 4, index: 3)
+    enc.setBuffer(kNormedBuf, offset: 0, index: 0); enc.setBytes(&nkv, length: 4, index: 3)
     enc.dispatchThreads(MTLSize(width: ROTARY_DIM / 2, height: NUM_KV_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-    // 7a. Append K to cache
     let cacheLayerOffset = attnIdx * kvLayerBytes
     let cacheTokenOffset = cacheLayerOffset + position * kvTokenBytes
     enc.setComputePipelineState(copyPSO)
-    enc.setBuffer(kNormedBuf, offset: 0, index: 0)
-    enc.setBuffer(kCache, offset: cacheTokenOffset, index: 1)
-    var kvCount = UInt32(NUM_KV_HEADS * HEAD_DIM)
-    enc.setBytes(&kvCount, length: 4, index: 2)
+    enc.setBuffer(kNormedBuf, offset: 0, index: 0); enc.setBuffer(kCache, offset: cacheTokenOffset, index: 1)
+    var kvCount = UInt32(NUM_KV_HEADS * HEAD_DIM); enc.setBytes(&kvCount, length: 4, index: 2)
+    enc.dispatchThreads(MTLSize(width: NUM_KV_HEADS * HEAD_DIM, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    enc.setBuffer(vBuf, offset: 0, index: 0); enc.setBuffer(vCache, offset: cacheTokenOffset, index: 1)
     enc.dispatchThreads(MTLSize(width: NUM_KV_HEADS * HEAD_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 7b. Append V to cache
-    enc.setBuffer(vBuf, offset: 0, index: 0)
-    enc.setBuffer(vCache, offset: cacheTokenOffset, index: 1)
-    enc.dispatchThreads(MTLSize(width: NUM_KV_HEADS * HEAD_DIM, height: 1, depth: 1),
-                        threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-
-    // 7c. SDPA
     enc.setComputePipelineState(sdpaPSO)
     enc.setBuffer(qNormedBuf, offset: 0, index: 0)
-    enc.setBuffer(kCache, offset: cacheLayerOffset, index: 1)
-    enc.setBuffer(vCache, offset: cacheLayerOffset, index: 2)
+    enc.setBuffer(kCache, offset: cacheLayerOffset, index: 1); enc.setBuffer(vCache, offset: cacheLayerOffset, index: 2)
     enc.setBuffer(attnOutBuf, offset: 0, index: 3)
-    enc.setBytes(&nh, length: 4, index: 4)
-    enc.setBytes(&nkv, length: 4, index: 5)
+    enc.setBytes(&nh, length: 4, index: 4); enc.setBytes(&nkv, length: 4, index: 5)
     enc.setBytes(&hd, length: 4, index: 6)
-    var seqLen = UInt32(position + 1)
-    enc.setBytes(&seqLen, length: 4, index: 7)
+    var seqLen = UInt32(position + 1); enc.setBytes(&seqLen, length: 4, index: 7)
     enc.dispatchThreads(MTLSize(width: NUM_HEADS, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: NUM_HEADS, height: 1, depth: 1))
 
-    // 8. Output gate
     enc.setComputePipelineState(sigmoidMulPSO)
-    enc.setBuffer(attnOutBuf, offset: 0, index: 0)
-    enc.setBuffer(attnGateBuf, offset: 0, index: 1)
+    enc.setBuffer(attnOutBuf, offset: 0, index: 0); enc.setBuffer(attnGateBuf, offset: 0, index: 1)
     enc.setBuffer(gatedBuf, offset: 0, index: 2)
-    var gateCount = UInt32(NUM_HEADS * HEAD_DIM)
-    enc.setBytes(&gateCount, length: 4, index: 3)
+    var gateCount = UInt32(NUM_HEADS * HEAD_DIM); enc.setBytes(&gateCount, length: 4, index: 3)
     enc.dispatchThreads(MTLSize(width: NUM_HEADS * HEAD_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 9. O projection
     dispatchQMatmul(enc, lw.oProjW!, lw.oProjS!, lw.oProjB!,
-                    gatedBuf, oOutBuf,
-                    K_dim: NUM_HEADS * HEAD_DIM, N_dim: HIDDEN_SIZE, M_dim: 1)
+                    gatedBuf, oOutBuf, K_dim: NUM_HEADS * HEAD_DIM, N_dim: HIDDEN_SIZE, M_dim: 1)
 
-    // 10. Residual
     enc.setComputePipelineState(residualPSO)
-    enc.setBuffer(hiddenBuf, offset: 0, index: 0)
-    enc.setBuffer(oOutBuf, offset: 0, index: 1)
-    enc.setBuffer(residualBuf, offset: 0, index: 2)
-    enc.setBytes(&count, length: 4, index: 3)
+    enc.setBuffer(hiddenBuf, offset: 0, index: 0); enc.setBuffer(oOutBuf, offset: 0, index: 1)
+    enc.setBuffer(residualBuf, offset: 0, index: 2); enc.setBytes(&count, length: 4, index: 3)
     enc.dispatchThreads(MTLSize(width: HIDDEN_SIZE, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 11. Post-attention norm
     enc.setComputePipelineState(rmsNormPSO)
-    enc.setBuffer(residualBuf, offset: 0, index: 0)
-    enc.setBuffer(lw.postNormWeight!, offset: 0, index: 1)
+    enc.setBuffer(residualBuf, offset: 0, index: 0); enc.setBuffer(lw.postNormWeight!, offset: 0, index: 1)
     enc.setBuffer(normedBuf, offset: 0, index: 2)
-    enc.setBytes(&dim, length: 4, index: 3)
-    enc.setBytes(&eps, length: 4, index: 4)
+    enc.setBytes(&dim, length: 4, index: 3); enc.setBytes(&eps, length: 4, index: 4)
     enc.dispatchThreads(MTLSize(width: 256, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 12-15. MLP
     dispatchMLP(enc, lw.gateProjW!, lw.gateProjS!, lw.gateProjB!,
                 lw.upProjW!, lw.upProjS!, lw.upProjB!,
                 lw.downProjW!, lw.downProjS!, lw.downProjB!)
 
-    // 16. Final residual
     enc.setComputePipelineState(residualPSO)
-    enc.setBuffer(residualBuf, offset: 0, index: 0)
-    enc.setBuffer(downProjBuf, offset: 0, index: 1)
-    enc.setBuffer(hiddenBuf, offset: 0, index: 2)
-    enc.setBytes(&count, length: 4, index: 3)
+    enc.setBuffer(residualBuf, offset: 0, index: 0); enc.setBuffer(downProjBuf, offset: 0, index: 1)
+    enc.setBuffer(hiddenBuf, offset: 0, index: 2); enc.setBytes(&count, length: 4, index: 3)
     enc.dispatchThreads(MTLSize(width: HIDDEN_SIZE, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 }
 
 // ============================================================================
-// MARK: - Dispatch: GDN Layer (uses pre-wired weights)
+// MARK: - Dispatch: GDN Layer
 // ============================================================================
 
 func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
@@ -1194,21 +982,15 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     let convOffset = gdnIdx * convStateBytes
     let deltaOffset = gdnIdx * deltaStateBytes
 
-    var dim = UInt32(HIDDEN_SIZE)
-    var eps = RMS_NORM_EPS
-    var count = UInt32(HIDDEN_SIZE)
+    var dim = UInt32(HIDDEN_SIZE); var eps = RMS_NORM_EPS; var count = UInt32(HIDDEN_SIZE)
 
-    // 1. Input norm
     enc.setComputePipelineState(rmsNormPSO)
-    enc.setBuffer(hiddenBuf, offset: 0, index: 0)
-    enc.setBuffer(lw.inputNormWeight!, offset: 0, index: 1)
+    enc.setBuffer(hiddenBuf, offset: 0, index: 0); enc.setBuffer(lw.inputNormWeight!, offset: 0, index: 1)
     enc.setBuffer(normedBuf, offset: 0, index: 2)
-    enc.setBytes(&dim, length: 4, index: 3)
-    enc.setBytes(&eps, length: 4, index: 4)
+    enc.setBytes(&dim, length: 4, index: 3); enc.setBytes(&eps, length: 4, index: 4)
     enc.dispatchThreads(MTLSize(width: 256, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 2. Projections
     dispatchQMatmul(enc, lw.qkvProjW!, lw.qkvProjS!, lw.qkvProjB!,
                     normedBuf, qkvBuf, K_dim: HIDDEN_SIZE, N_dim: GDN_CONV_DIM, M_dim: 1)
     dispatchQMatmul(enc, lw.zProjW!, lw.zProjS!, lw.zProjB!,
@@ -1218,145 +1000,98 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     dispatchQMatmul(enc, lw.aProjW!, lw.aProjS!, lw.aProjB!,
                     normedBuf, aBuf, K_dim: HIDDEN_SIZE, N_dim: GDN_NUM_V_HEADS, M_dim: 1)
 
-    // 3. Depthwise conv1d
     enc.setComputePipelineState(depthwiseConvPSO)
-    enc.setBuffer(convStateRead, offset: convOffset, index: 0)
-    enc.setBuffer(qkvBuf, offset: 0, index: 1)
-    enc.setBuffer(lw.convWeight!, offset: 0, index: 2)
-    enc.setBuffer(convOutBuf, offset: 0, index: 3)
+    enc.setBuffer(convStateRead, offset: convOffset, index: 0); enc.setBuffer(qkvBuf, offset: 0, index: 1)
+    enc.setBuffer(lw.convWeight!, offset: 0, index: 2); enc.setBuffer(convOutBuf, offset: 0, index: 3)
     enc.setBuffer(convStateWrite, offset: convOffset, index: 4)
-    var cdim = UInt32(GDN_CONV_DIM)
-    enc.setBytes(&cdim, length: 4, index: 5)
+    var cdim = UInt32(GDN_CONV_DIM); enc.setBytes(&cdim, length: 4, index: 5)
     enc.dispatchThreads(MTLSize(width: GDN_CONV_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 4. SiLU
     enc.setComputePipelineState(siluPSO)
-    enc.setBuffer(convOutBuf, offset: 0, index: 0)
-    enc.setBuffer(convSiluBuf, offset: 0, index: 1)
+    enc.setBuffer(convOutBuf, offset: 0, index: 0); enc.setBuffer(convSiluBuf, offset: 0, index: 1)
     enc.setBytes(&cdim, length: 4, index: 2)
     enc.dispatchThreads(MTLSize(width: GDN_CONV_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 6. QK norm with scale
     enc.setComputePipelineState(perHeadRmsNormScaledPSO)
-    enc.setBuffer(convSiluBuf, offset: 0, index: 0)
-    enc.setBuffer(gdnQNormedBuf, offset: 0, index: 1)
-    var nkh = UInt32(GDN_NUM_K_HEADS)
-    var hkd = UInt32(GDN_HEAD_K_DIM)
-    var normEps: Float = 1e-6
-    enc.setBytes(&nkh, length: 4, index: 2)
-    enc.setBytes(&hkd, length: 4, index: 3)
+    enc.setBuffer(convSiluBuf, offset: 0, index: 0); enc.setBuffer(gdnQNormedBuf, offset: 0, index: 1)
+    var nkh = UInt32(GDN_NUM_K_HEADS); var hkd = UInt32(GDN_HEAD_K_DIM); var normEps: Float = 1e-6
+    enc.setBytes(&nkh, length: 4, index: 2); enc.setBytes(&hkd, length: 4, index: 3)
     enc.setBytes(&normEps, length: 4, index: 4)
-    var qScale: Float = GDN_INV_SCALE * GDN_INV_SCALE
-    enc.setBytes(&qScale, length: 4, index: 5)
+    var qScale: Float = GDN_INV_SCALE * GDN_INV_SCALE; enc.setBytes(&qScale, length: 4, index: 5)
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_K_DIM, height: GDN_NUM_K_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: GDN_HEAD_K_DIM, height: 1, depth: 1))
 
-    // K norm
-    enc.setBuffer(convSiluBuf, offset: GDN_KEY_DIM * 2, index: 0)
-    enc.setBuffer(gdnKNormedBuf, offset: 0, index: 1)
-    var kScale: Float = GDN_INV_SCALE
-    enc.setBytes(&kScale, length: 4, index: 5)
+    enc.setBuffer(convSiluBuf, offset: GDN_KEY_DIM * 2, index: 0); enc.setBuffer(gdnKNormedBuf, offset: 0, index: 1)
+    var kScale: Float = GDN_INV_SCALE; enc.setBytes(&kScale, length: 4, index: 5)
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_K_DIM, height: GDN_NUM_K_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: GDN_HEAD_K_DIM, height: 1, depth: 1))
 
-    // 7. Expand K heads
     var nvh = UInt32(GDN_NUM_V_HEADS)
     enc.setComputePipelineState(expandKvPSO)
-    enc.setBuffer(gdnQNormedBuf, offset: 0, index: 0)
-    enc.setBuffer(gdnQExpandedBuf, offset: 0, index: 1)
-    enc.setBytes(&nvh, length: 4, index: 2)
-    enc.setBytes(&nkh, length: 4, index: 3)
-    enc.setBytes(&hkd, length: 4, index: 4)
+    enc.setBuffer(gdnQNormedBuf, offset: 0, index: 0); enc.setBuffer(gdnQExpandedBuf, offset: 0, index: 1)
+    enc.setBytes(&nvh, length: 4, index: 2); enc.setBytes(&nkh, length: 4, index: 3); enc.setBytes(&hkd, length: 4, index: 4)
+    enc.dispatchThreads(MTLSize(width: GDN_HEAD_K_DIM, height: GDN_NUM_V_HEADS, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    enc.setBuffer(gdnKNormedBuf, offset: 0, index: 0); enc.setBuffer(gdnKExpandedBuf, offset: 0, index: 1)
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_K_DIM, height: GDN_NUM_V_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
 
-    enc.setBuffer(gdnKNormedBuf, offset: 0, index: 0)
-    enc.setBuffer(gdnKExpandedBuf, offset: 0, index: 1)
-    enc.dispatchThreads(MTLSize(width: GDN_HEAD_K_DIM, height: GDN_NUM_V_HEADS, depth: 1),
-                        threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-
-    // 8. Compute g and beta
     enc.setComputePipelineState(computeGBetaPSO)
-    enc.setBuffer(aBuf, offset: 0, index: 0)
-    enc.setBuffer(bBuf, offset: 0, index: 1)
-    enc.setBuffer(lw.ALog!, offset: 0, index: 2)
-    enc.setBuffer(lw.dtBias!, offset: 0, index: 3)
-    enc.setBuffer(gBuf, offset: 0, index: 4)
-    enc.setBuffer(betaBuf, offset: 0, index: 5)
+    enc.setBuffer(aBuf, offset: 0, index: 0); enc.setBuffer(bBuf, offset: 0, index: 1)
+    enc.setBuffer(lw.ALog!, offset: 0, index: 2); enc.setBuffer(lw.dtBias!, offset: 0, index: 3)
+    enc.setBuffer(gBuf, offset: 0, index: 4); enc.setBuffer(betaBuf, offset: 0, index: 5)
     enc.setBytes(&nvh, length: 4, index: 6)
     enc.dispatchThreads(MTLSize(width: GDN_NUM_V_HEADS, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 48, height: 1, depth: 1))
 
-    // 9. Gated delta step
     enc.setComputePipelineState(gdnStepPSO)
-    enc.setBuffer(gdnQExpandedBuf, offset: 0, index: 0)
-    enc.setBuffer(gdnKExpandedBuf, offset: 0, index: 1)
+    enc.setBuffer(gdnQExpandedBuf, offset: 0, index: 0); enc.setBuffer(gdnKExpandedBuf, offset: 0, index: 1)
     enc.setBuffer(convSiluBuf, offset: GDN_KEY_DIM * 2 * 2, index: 2)
-    enc.setBuffer(gBuf, offset: 0, index: 3)
-    enc.setBuffer(betaBuf, offset: 0, index: 4)
-    enc.setBuffer(deltaState, offset: deltaOffset, index: 5)
-    enc.setBuffer(gdnYBuf, offset: 0, index: 6)
+    enc.setBuffer(gBuf, offset: 0, index: 3); enc.setBuffer(betaBuf, offset: 0, index: 4)
+    enc.setBuffer(deltaState, offset: deltaOffset, index: 5); enc.setBuffer(gdnYBuf, offset: 0, index: 6)
     var hvd = UInt32(GDN_HEAD_V_DIM)
-    enc.setBytes(&nvh, length: 4, index: 7)
-    enc.setBytes(&hvd, length: 4, index: 8)
-    enc.setBytes(&hkd, length: 4, index: 9)
+    enc.setBytes(&nvh, length: 4, index: 7); enc.setBytes(&hvd, length: 4, index: 8); enc.setBytes(&hkd, length: 4, index: 9)
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_V_DIM, height: GDN_NUM_V_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
 
-    // 10. RMSNormGated
     enc.setComputePipelineState(rmsNormGatedPSO)
-    enc.setBuffer(gdnYBuf, offset: 0, index: 0)
-    enc.setBuffer(zBuf, offset: 0, index: 1)
-    enc.setBuffer(lw.normWeight!, offset: 0, index: 2)
-    enc.setBuffer(gdnNormedBuf, offset: 0, index: 3)
-    enc.setBytes(&nvh, length: 4, index: 4)
-    enc.setBytes(&hvd, length: 4, index: 5)
-    enc.setBytes(&eps, length: 4, index: 6)
+    enc.setBuffer(gdnYBuf, offset: 0, index: 0); enc.setBuffer(zBuf, offset: 0, index: 1)
+    enc.setBuffer(lw.normWeight!, offset: 0, index: 2); enc.setBuffer(gdnNormedBuf, offset: 0, index: 3)
+    enc.setBytes(&nvh, length: 4, index: 4); enc.setBytes(&hvd, length: 4, index: 5); enc.setBytes(&eps, length: 4, index: 6)
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_V_DIM, height: GDN_NUM_V_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
 
-    // 11. Out projection
     dispatchQMatmul(enc, lw.outProjW!, lw.outProjS!, lw.outProjB!,
                     gdnNormedBuf, gdnOutProjBuf, K_dim: GDN_VALUE_DIM, N_dim: HIDDEN_SIZE, M_dim: 1)
 
-    // 12. Residual
     enc.setComputePipelineState(residualPSO)
-    enc.setBuffer(hiddenBuf, offset: 0, index: 0)
-    enc.setBuffer(gdnOutProjBuf, offset: 0, index: 1)
-    enc.setBuffer(residualBuf, offset: 0, index: 2)
-    enc.setBytes(&count, length: 4, index: 3)
+    enc.setBuffer(hiddenBuf, offset: 0, index: 0); enc.setBuffer(gdnOutProjBuf, offset: 0, index: 1)
+    enc.setBuffer(residualBuf, offset: 0, index: 2); enc.setBytes(&count, length: 4, index: 3)
     enc.dispatchThreads(MTLSize(width: HIDDEN_SIZE, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 13. Post-attention norm
     enc.setComputePipelineState(rmsNormPSO)
-    enc.setBuffer(residualBuf, offset: 0, index: 0)
-    enc.setBuffer(lw.postNormWeight!, offset: 0, index: 1)
+    enc.setBuffer(residualBuf, offset: 0, index: 0); enc.setBuffer(lw.postNormWeight!, offset: 0, index: 1)
     enc.setBuffer(normedBuf, offset: 0, index: 2)
-    enc.setBytes(&dim, length: 4, index: 3)
-    enc.setBytes(&eps, length: 4, index: 4)
+    enc.setBytes(&dim, length: 4, index: 3); enc.setBytes(&eps, length: 4, index: 4)
     enc.dispatchThreads(MTLSize(width: 256, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 14. MLP
     dispatchMLP(enc, lw.gateProjW!, lw.gateProjS!, lw.gateProjB!,
                 lw.upProjW!, lw.upProjS!, lw.upProjB!,
                 lw.downProjW!, lw.downProjS!, lw.downProjB!)
 
-    // 15. Final residual
     enc.setComputePipelineState(residualPSO)
-    enc.setBuffer(residualBuf, offset: 0, index: 0)
-    enc.setBuffer(downProjBuf, offset: 0, index: 1)
-    enc.setBuffer(hiddenBuf, offset: 0, index: 2)
-    enc.setBytes(&count, length: 4, index: 3)
+    enc.setBuffer(residualBuf, offset: 0, index: 0); enc.setBuffer(downProjBuf, offset: 0, index: 1)
+    enc.setBuffer(hiddenBuf, offset: 0, index: 2); enc.setBytes(&count, length: 4, index: 3)
     enc.dispatchThreads(MTLSize(width: HIDDEN_SIZE, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 }
 
 // ============================================================================
-// MARK: - Dispatch: MLP (shared between attn and GDN)
+// MARK: - Dispatch: MLP
 // ============================================================================
 
 func dispatchMLP(_ enc: MTLComputeCommandEncoder,
@@ -1364,28 +1099,21 @@ func dispatchMLP(_ enc: MTLComputeCommandEncoder,
                  _ upW: MTLBuffer, _ upS: MTLBuffer, _ upB: MTLBuffer,
                  _ downW: MTLBuffer, _ downS: MTLBuffer, _ downB: MTLBuffer) {
     dispatchQMatmul(enc, gateW, gateS, gateB,
-                    normedBuf, gateProjBuf,
-                    K_dim: HIDDEN_SIZE, N_dim: INTERMEDIATE_SIZE, M_dim: 1)
+                    normedBuf, gateProjBuf, K_dim: HIDDEN_SIZE, N_dim: INTERMEDIATE_SIZE, M_dim: 1)
     dispatchQMatmul(enc, upW, upS, upB,
-                    normedBuf, upProjBuf,
-                    K_dim: HIDDEN_SIZE, N_dim: INTERMEDIATE_SIZE, M_dim: 1)
-
+                    normedBuf, upProjBuf, K_dim: HIDDEN_SIZE, N_dim: INTERMEDIATE_SIZE, M_dim: 1)
     enc.setComputePipelineState(siluMulPSO)
-    enc.setBuffer(gateProjBuf, offset: 0, index: 0)
-    enc.setBuffer(upProjBuf, offset: 0, index: 1)
+    enc.setBuffer(gateProjBuf, offset: 0, index: 0); enc.setBuffer(upProjBuf, offset: 0, index: 1)
     enc.setBuffer(mlpHiddenBuf, offset: 0, index: 2)
-    var isize = UInt32(INTERMEDIATE_SIZE)
-    enc.setBytes(&isize, length: 4, index: 3)
+    var isize = UInt32(INTERMEDIATE_SIZE); enc.setBytes(&isize, length: 4, index: 3)
     enc.dispatchThreads(MTLSize(width: INTERMEDIATE_SIZE, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-
     dispatchQMatmul(enc, downW, downS, downB,
-                    mlpHiddenBuf, downProjBuf,
-                    K_dim: INTERMEDIATE_SIZE, N_dim: HIDDEN_SIZE, M_dim: 1)
+                    mlpHiddenBuf, downProjBuf, K_dim: INTERMEDIATE_SIZE, N_dim: HIDDEN_SIZE, M_dim: 1)
 }
 
 // ============================================================================
-// MARK: - Warm Forward Pass (all weights pre-loaded, no per-layer mmap)
+// MARK: - Warm Forward Pass with Prefetch + Overlap
 // ============================================================================
 
 var convStateFlip = true
@@ -1394,41 +1122,45 @@ func warmForwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tok
     let tStart = CFAbsoluteTimeGetCurrent()
     precomputeRoPE(position: position)
 
-    // --- Embedding (targeted row lookup from mmap, ~3KB) ---
-    embedFromMmap(tokenId: tokenId)
+    // Prefetch first layer
+    prefetchLayer(0)
 
+    // Embedding (targeted row from mmap)
+    embedFromMmap(tokenId: tokenId)
     let cbEmbed = queue.makeCommandBuffer()!
     let encEmbed = cbEmbed.makeComputeCommandEncoder()!
     encEmbed.setComputePipelineState(embedRowPSO)
-    encEmbed.setBuffer(embedRowWBuf, offset: 0, index: 0)
-    encEmbed.setBuffer(embedRowSBuf, offset: 0, index: 1)
-    encEmbed.setBuffer(embedRowBBuf, offset: 0, index: 2)
-    encEmbed.setBuffer(hiddenBuf, offset: 0, index: 3)
-    var hdim = UInt32(HIDDEN_SIZE)
-    encEmbed.setBytes(&hdim, length: 4, index: 4)
-    var gsz = UInt32(GROUP_SIZE)
-    encEmbed.setBytes(&gsz, length: 4, index: 5)
+    encEmbed.setBuffer(embedRowWBuf, offset: 0, index: 0); encEmbed.setBuffer(embedRowSBuf, offset: 0, index: 1)
+    encEmbed.setBuffer(embedRowBBuf, offset: 0, index: 2); encEmbed.setBuffer(hiddenBuf, offset: 0, index: 3)
+    var hdim = UInt32(HIDDEN_SIZE); encEmbed.setBytes(&hdim, length: 4, index: 4)
+    var gsz = UInt32(GROUP_SIZE); encEmbed.setBytes(&gsz, length: 4, index: 5)
     encEmbed.dispatchThreads(MTLSize(width: HIDDEN_SIZE, height: 1, depth: 1),
                              threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     encEmbed.endEncoding()
     cbEmbed.commit()
     cbEmbed.waitUntilCompleted()
 
-    // --- 64 Layers (warm layers from Metal buffers, cold layers streamed from mmap) ---
+    // 64 Layers with prefetch: load layer N, prefetch N+1, dispatch, wait
     for layerIdx in 0..<NUM_LAYERS {
         let tLayer = CFAbsoluteTimeGetCurrent()
 
+        // Prefetch NEXT layer's weights (async kernel readahead)
+        if layerIdx + 1 < NUM_LAYERS {
+            prefetchLayer(layerIdx + 1)
+        } else {
+            prefetchLmHead()
+        }
+
+        // Load current layer weights into Metal buffers
         let cb = queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
 
-        let isWarm = layerIdx <= lastWiredLayer
-
         if isFullAttn(layerIdx) {
-            let lw = isWarm ? warmAttnLayers[layerIdx]! : loadAttnLayerCold(layerIdx)
+            let lw = loadAttnLayer(layerIdx)
             dispatchAttnLayer(enc, lw, attnIdx: attnLayerIndex[layerIdx]!, position: position)
         } else {
             let gIdx = gdnLayerIndex[layerIdx]!
-            let lw = isWarm ? warmGDNLayers[layerIdx]! : loadGDNLayerCold(layerIdx)
+            let lw = loadGDNLayer(layerIdx)
             dispatchGDNLayer(enc, lw, gdnIdx: gIdx, useConvA: convStateFlip)
         }
 
@@ -1444,9 +1176,8 @@ func warmForwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tok
         if verbose {
             let layerMs = (CFAbsoluteTimeGetCurrent() - tLayer) * 1000
             let layerType = isFullAttn(layerIdx) ? "ATTN" : "GDN"
-            let pathTag = isWarm ? "WARM" : "COLD"
             if layerIdx < 4 || layerIdx >= 60 || layerIdx % 16 == 0 {
-                print("  Layer \(String(format: "%2d", layerIdx)) [\(layerType)] \(pathTag): \(String(format: "%.1f", layerMs))ms")
+                print("  Layer \(String(format: "%2d", layerIdx)) [\(layerType)]: \(String(format: "%.1f", layerMs))ms")
             } else if layerIdx == 4 {
                 print("  ...")
             }
@@ -1455,25 +1186,21 @@ func warmForwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tok
 
     convStateFlip = !convStateFlip
 
-    // --- Final norm ---
+    // Final norm
     let cbFinal = queue.makeCommandBuffer()!
     let encFinal = cbFinal.makeComputeCommandEncoder()!
-
     encFinal.setComputePipelineState(rmsNormPSO)
-    encFinal.setBuffer(hiddenBuf, offset: 0, index: 0)
-    encFinal.setBuffer(finalNormW, offset: 0, index: 1)
+    encFinal.setBuffer(hiddenBuf, offset: 0, index: 0); encFinal.setBuffer(finalNormW, offset: 0, index: 1)
     encFinal.setBuffer(normedBuf, offset: 0, index: 2)
-    var dim2 = UInt32(HIDDEN_SIZE)
-    encFinal.setBytes(&dim2, length: 4, index: 3)
-    var eps2 = RMS_NORM_EPS
-    encFinal.setBytes(&eps2, length: 4, index: 4)
+    var dim2 = UInt32(HIDDEN_SIZE); encFinal.setBytes(&dim2, length: 4, index: 3)
+    var eps2 = RMS_NORM_EPS; encFinal.setBytes(&eps2, length: 4, index: 4)
     encFinal.dispatchThreads(MTLSize(width: 256, height: 1, depth: 1),
                              threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     encFinal.endEncoding()
     cbFinal.commit()
     cbFinal.waitUntilCompleted()
 
-    // --- lm_head (streamed from mmap each token — 682MB, not worth pre-loading on 16GB) ---
+    // lm_head (streamed)
     let lmW = loadTensorToBuffer(device, mmaps, lmHeadWInfo)
     let lmS = loadTensorToBuffer(device, mmaps, lmHeadSInfo)
     let lmB = loadTensorToBuffer(device, mmaps, lmHeadBInfo)
@@ -1481,121 +1208,196 @@ func warmForwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tok
     let cbLm = queue.makeCommandBuffer()!
     let encLm = cbLm.makeComputeCommandEncoder()!
     dispatchQMatmul(encLm, lmW, lmS, lmB,
-                    normedBuf, logitsBuf,
-                    K_dim: HIDDEN_SIZE, N_dim: VOCAB_SIZE, M_dim: 1)
-
-    // Argmax
+                    normedBuf, logitsBuf, K_dim: HIDDEN_SIZE, N_dim: VOCAB_SIZE, M_dim: 1)
     encLm.setComputePipelineState(argmaxPSO)
-    encLm.setBuffer(logitsBuf, offset: 0, index: 0)
-    encLm.setBuffer(argmaxBuf, offset: 0, index: 1)
-    var vocabSize = UInt32(VOCAB_SIZE)
-    encLm.setBytes(&vocabSize, length: 4, index: 2)
+    encLm.setBuffer(logitsBuf, offset: 0, index: 0); encLm.setBuffer(argmaxBuf, offset: 0, index: 1)
+    var vocabSize = UInt32(VOCAB_SIZE); encLm.setBytes(&vocabSize, length: 4, index: 2)
     encLm.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
                           threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
-
     encLm.endEncoding()
     cbLm.commit()
     cbLm.waitUntilCompleted()
 
     let result = argmaxBuf.contents().bindMemory(to: UInt32.self, capacity: 1)
     let totalMs = (CFAbsoluteTimeGetCurrent() - tStart) * 1000
-
     return (Int(result[0]), totalMs)
 }
 
 // ============================================================================
-// MARK: - Autoregressive Generation
+// MARK: - Load Prompt from File (or fallback to Hello token)
 // ============================================================================
 
-// Single "Hello" token — no prompt file needed for warm path test
-let promptTokens: [Int] = [9419]
-let maxGenerate = 50
+var promptTokens: [Int] = []
+var maxGenerate = 400
+
+// Accept prompt path as command-line argument, or use default
+let promptPath: String
+if CommandLine.arguments.count > 1 {
+    promptPath = CommandLine.arguments[1]
+} else {
+    promptPath = "/Users/midas/Desktop/cowork/inference-across-metal/overnight_prompt_tokens.json"
+}
+
+if FileManager.default.fileExists(atPath: promptPath) {
+    let data = try! Data(contentsOf: URL(fileURLWithPath: promptPath))
+    let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+    promptTokens = (obj["tokens"] as! [Any]).map { ($0 as! NSNumber).intValue }
+    maxGenerate = (obj["max_generate"] as? NSNumber)?.intValue ?? 400
+    print("\nLoaded prompt: \(promptTokens.count) tokens, max_generate=\(maxGenerate)")
+    print("Source: \(obj["source"] as? String ?? "unknown")")
+} else {
+    promptTokens = [9419]
+    maxGenerate = 50
+    print("\nNo prompt file found, using Hello token")
+}
+
+// Qwen3.5 EOS token IDs
+let EOS_IM_END: Int = 248046      // <|im_end|>
+let EOS_ENDOFTEXT: Int = 248044   // <|endoftext|>
+
+// ============================================================================
+// MARK: - Generation
+// ============================================================================
 
 print("\n" + String(repeating: "=", count: 60))
 print("WARM PATH Generation — Qwen3.5-27B on M5 Air 16GB")
-print("Prompt: token 9419 (Hello), Generate: \(maxGenerate) tokens")
-print("All weights pre-loaded in Metal shared buffers")
+print("Strategy: mmap + MADV_WILLNEED prefetch + per-layer streaming")
+print("Prompt: \(promptTokens.count) tokens, Generate: \(maxGenerate) tokens")
+print("Estimated time: \((promptTokens.count + maxGenerate) * 8 / 60) min")
 print(String(repeating: "=", count: 60))
 
 var generatedTokens: [Int] = []
-
 let tGenStart = CFAbsoluteTimeGetCurrent()
 
-// First token
-print("\nGenerating (verbose first token)...")
-let (firstGen, firstMs) = warmForwardPass(tokenId: promptTokens[0], position: 0, verbose: true)
-if firstGen < 0 {
-    print("FATAL: First token failed")
-    exit(1)
+// --- Phase 1: Prefill (process prompt tokens) ---
+var lastPrefillToken: Int = -1
+if promptTokens.count > 1 {
+    print("\nPhase 1: Prefill (\(promptTokens.count) tokens)...")
+    for (i, token) in promptTokens.enumerated() {
+        let position = i
+        let (nextToken, stepMs) = warmForwardPass(tokenId: token, position: position)
+        lastPrefillToken = nextToken
+
+        if i < 3 || i == promptTokens.count - 1 || i % 50 == 0 {
+            let elapsed = CFAbsoluteTimeGetCurrent() - tGenStart
+            let pct = Double(i + 1) / Double(promptTokens.count) * 100
+            print("  Prefill \(String(format: "%3d", i+1))/\(promptTokens.count) " +
+                  "(\(String(format: "%.0f", pct))%) " +
+                  "[\(String(format: "%.1f", stepMs))ms, " +
+                  "\(String(format: "%.0f", elapsed))s elapsed]")
+        }
+    }
+    let prefillTime = CFAbsoluteTimeGetCurrent() - tGenStart
+    print("  Prefill complete: \(String(format: "%.0f", prefillTime))s " +
+          "(\(String(format: "%.1f", prefillTime / 60))min)")
 }
-generatedTokens.append(firstGen)
-print("  Token 1: \(firstGen) [\(String(format: "%.1f", firstMs))ms]")
 
-var currentToken = firstGen
+// --- Phase 2: Generate ---
+print("\nPhase 2: Generate (\(maxGenerate) tokens)...")
+let tGenPhase = CFAbsoluteTimeGetCurrent()
 
-for step in 1..<maxGenerate {
-    let position = step
+var currentToken: Int
+if promptTokens.count > 1 {
+    currentToken = lastPrefillToken
+} else {
+    let (firstGen, firstMs) = warmForwardPass(tokenId: promptTokens[0], position: 0, verbose: true)
+    if firstGen < 0 { print("FATAL"); exit(1) }
+    currentToken = firstGen
+    print("  Token 1: \(firstGen) [\(String(format: "%.1f", firstMs))ms]")
+}
+generatedTokens.append(currentToken)
 
-    if position >= MAX_SEQ - 1 {
-        print("  KV cache full at position \(position)")
-        break
-    }
+// Check if the very first generated token is EOS
+var earlyEOS = false
+if currentToken == EOS_IM_END || currentToken == EOS_ENDOFTEXT {
+    print("  EOS on first token (\(currentToken)). Nothing to generate.")
+    earlyEOS = true
+}
 
+let genStartPos = promptTokens.count
+
+for step in 1..<maxGenerate where !earlyEOS {
+    let position = genStartPos + step - 1
+    if position >= MAX_SEQ - 1 { print("  KV cache full at position \(position)"); break }
     let (nextToken, stepMs) = warmForwardPass(tokenId: currentToken, position: position)
-
-    if nextToken < 0 {
-        print("ERROR at step \(step)")
-        break
-    }
-
+    if nextToken < 0 { print("ERROR at step \(step)"); break }
     generatedTokens.append(nextToken)
     currentToken = nextToken
-
-    let elapsed = CFAbsoluteTimeGetCurrent() - tGenStart
+    let elapsed = CFAbsoluteTimeGetCurrent() - tGenPhase
     let tokPerSec = Double(step + 1) / elapsed
-
     print("  Gen \(String(format: "%3d", step+1))/\(maxGenerate): " +
-          "token \(String(format: "%6d", nextToken))  " +
-          "[\(String(format: "%.1f", stepMs))ms, " +
-          "\(String(format: "%.2f", tokPerSec)) tok/s]")
-
-    if nextToken == 151643 || nextToken == 151645 {
-        print("  (EOS)")
+          "token \(String(format: "%6d", nextToken)) " +
+          "[\(String(format: "%.1f", stepMs))ms, \(String(format: "%.3f", tokPerSec)) tok/s]")
+    // Qwen3.5 EOS: 248046 = <|im_end|>, 248044 = <|endoftext|>
+    if nextToken == EOS_IM_END || nextToken == EOS_ENDOFTEXT {
+        print("  EOS detected (token \(nextToken)). Generation complete.")
         break
     }
 }
 
 let tGenTotal = CFAbsoluteTimeGetCurrent() - tGenStart
+let genPhaseTime = CFAbsoluteTimeGetCurrent() - tGenPhase
+let prefillTime = tGenPhase - tGenStart
 
 print("\n" + String(repeating: "=", count: 60))
-print("WARM PATH GENERATION COMPLETE")
+print("GENERATION COMPLETE")
 print(String(repeating: "=", count: 60))
+print("Prompt tokens:    \(promptTokens.count)")
 print("Generated tokens: \(generatedTokens.count)")
-print("Total gen time:   \(String(format: "%.1f", tGenTotal))s")
-print("Avg tok/s:        \(String(format: "%.3f", Double(generatedTokens.count) / tGenTotal))")
-print("Avg ms/token:     \(String(format: "%.1f", tGenTotal * 1000 / Double(generatedTokens.count)))")
-print("Wiring overhead:  \(String(format: "%.1f", tWarmTotal))s (one-time)")
+print("Total time:       \(String(format: "%.0f", tGenTotal))s (\(String(format: "%.1f", tGenTotal / 60))min)")
+if promptTokens.count > 1 {
+    print("  Prefill:        \(String(format: "%.0f", prefillTime))s")
+    print("  Generation:     \(String(format: "%.0f", genPhaseTime))s")
+}
+print("Gen tok/s:        \(String(format: "%.4f", Double(generatedTokens.count) / genPhaseTime))")
 
-// Save results
-let resultPath = "/Users/midas/Desktop/cowork/inference-across-metal/warm_result.json"
+// Determine output path: use --output arg or derive from prompt path
+let basePath = "/Users/midas/Desktop/cowork/inference-across-metal"
+let resultPath: String
+let outputTokensPath: String
+if let outputIdx = CommandLine.arguments.firstIndex(of: "--output"), outputIdx + 1 < CommandLine.arguments.count {
+    resultPath = CommandLine.arguments[outputIdx + 1]
+    outputTokensPath = resultPath.replacingOccurrences(of: ".json", with: "_tokens.json")
+} else {
+    resultPath = basePath + "/warm_result.json"
+    outputTokensPath = basePath + "/warm_output_tokens.json"
+}
+
+// Check if generation ended with EOS
+let hitEOS = !generatedTokens.isEmpty &&
+    (generatedTokens.last == EOS_IM_END || generatedTokens.last == EOS_ENDOFTEXT)
+
+// Strip EOS token from output for cleaner decoding
+var outputTokens = generatedTokens
+if hitEOS { outputTokens.removeLast() }
+
 let resultDict: [String: Any] = [
-    "mode": "warm_path",
+    "mode": "warm_path_prefetch",
+    "prompt_tokens": promptTokens.count,
     "generated_tokens": generatedTokens.count,
-    "total_gen_time_s": tGenTotal,
-    "avg_tok_per_s": Double(generatedTokens.count) / tGenTotal,
-    "avg_ms_per_token": tGenTotal * 1000 / Double(generatedTokens.count),
-    "wiring_time_s": tWarmTotal,
-    "wired_mb": totalWiredBytes / 1024 / 1024,
+    "output_tokens": outputTokens.count,
+    "hit_eos": hitEOS,
+    "total_time_s": tGenTotal,
+    "prefill_time_s": prefillTime,
+    "gen_time_s": genPhaseTime,
+    "avg_tok_per_s": Double(generatedTokens.count) / genPhaseTime,
+    "avg_ms_per_token": genPhaseTime * 1000 / Double(generatedTokens.count),
     "generated_token_ids": generatedTokens,
 ]
 let resultData = try! JSONSerialization.data(withJSONObject: resultDict, options: .prettyPrinted)
 try! resultData.write(to: URL(fileURLWithPath: resultPath))
-print("\nResults saved to: \(resultPath)")
+print("Results saved to: \(resultPath)")
 
-print("\nGenerated token IDs: \(generatedTokens)")
+// Save output token IDs separately for easy Python decoding
+let tokensDict: [String: Any] = [
+    "tokens": outputTokens,
+    "hit_eos": hitEOS,
+    "prompt_tokens": promptTokens.count,
+    "generated_tokens": outputTokens.count,
+]
+let tokensData = try! JSONSerialization.data(withJSONObject: tokensDict, options: .prettyPrinted)
+try! tokensData.write(to: URL(fileURLWithPath: outputTokensPath))
+print("Output tokens saved to: \(outputTokensPath)")
+
 print("\nDecode with:")
-print("python3 -c \"from transformers import AutoTokenizer; " +
-      "t=AutoTokenizer.from_pretrained('/Users/midas/models/Qwen3.5-27B-MLX-4bit'); " +
-      "print(t.decode(\(generatedTokens)))\"")
-
-print("\nDone.")
+print("  python3 \(basePath)/tokenize_prompt.py --decode \(outputTokensPath)")

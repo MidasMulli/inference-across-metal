@@ -28,5 +28,13 @@ overnight_prompt_tokens.json
 context_test_output.log
 context_test_results.json
 
+# Benchmark data (contains domain-specific gold annotations)
+benchmark/
+
+# Extraction run output
+*_nothink_output.log
+warm_result.json
+warm_output_tokens.json
+
 # macOS
 .DS_Store
