@@ -1,18 +1,14 @@
-// full_forward.swift — Session 3: Complete 64-layer forward pass
-// Qwen3.5-27B on 16GB M5 Air via streaming weight loading
+// test_context.swift — KV Cache + Prefill Context Verification
+// Tests that the KV cache carries prompt context into generation.
 //
-// Strategy: Load one layer at a time from mmap (~200MB), process, release.
-// Persistent: embed (682MB), final_norm (10KB), GDN state (147MB), activations (~100MB)
-// Streamed: 64 layers + lm_head loaded/released per forward pass
-//
-// Build: swiftc -O -framework Metal -framework MetalPerformanceShaders full_forward.swift -o full_forward
-// Run:   ./full_forward
+// Build: swiftc -O -framework Metal -framework MetalPerformanceShaders test_context.swift -o test_context
+// Run:   ./test_context
 
 import Metal
 import Foundation
 
 // ============================================================================
-// MARK: - Config
+// MARK: - Config (identical to full_forward.swift)
 // ============================================================================
 
 let HIDDEN_SIZE: Int = 5120
@@ -28,7 +24,6 @@ let ROTARY_DIM: Int = 64
 let GROUP_SIZE: Int = 64
 let BITS: Int = 4
 
-// GDN config
 let GDN_NUM_K_HEADS: Int = 16
 let GDN_NUM_V_HEADS: Int = 48
 let GDN_HEAD_K_DIM: Int = 128
@@ -38,10 +33,9 @@ let GDN_VALUE_DIM: Int = 6144
 let GDN_CONV_DIM: Int = 10240
 let GDN_CONV_KERNEL: Int = 4
 let GDN_KV_REPEAT: Int = 3
-let GDN_INV_SCALE: Float = 0.08838834764  // 1/sqrt(128)
+let GDN_INV_SCALE: Float = 0.08838834764
 let GDN_STATE_SIZE: Int = 48 * 128 * 128
 
-// Layer type: every 4th layer (3, 7, 11, ..., 63) is full attention
 let FULL_ATTN_INTERVAL: Int = 4
 
 func isFullAttn(_ layerIdx: Int) -> Bool {
@@ -49,7 +43,7 @@ func isFullAttn(_ layerIdx: Int) -> Bool {
 }
 
 // ============================================================================
-// MARK: - Metal Kernel Source
+// MARK: - Metal Kernels (same as full_forward.swift)
 // ============================================================================
 
 let metalSource = """
@@ -380,7 +374,6 @@ kernel void rms_norm_gated_bf16(
     out[base + elem] = bfloat(silu_z * x_normed);
 }
 
-// Copy bf16 buffer (for KV cache append)
 kernel void copy_bf16(
     device const bfloat* src [[buffer(0)]],
     device bfloat* dst       [[buffer(1)]],
@@ -391,13 +384,11 @@ kernel void copy_bf16(
     dst[tid] = src[tid];
 }
 
-// Scaled dot-product attention for M=1 decode with KV cache
-// One thread per Q head — computes full attention output for that head
 kernel void sdpa_decode_bf16(
-    device const bfloat* q        [[buffer(0)]],  // (num_heads, head_dim) — after norm+RoPE
-    device const bfloat* k_cache  [[buffer(1)]],  // (seq_len, num_kv_heads, head_dim)
-    device const bfloat* v_cache  [[buffer(2)]],  // (seq_len, num_kv_heads, head_dim)
-    device bfloat* out            [[buffer(3)]],  // (num_heads, head_dim)
+    device const bfloat* q        [[buffer(0)]],
+    device const bfloat* k_cache  [[buffer(1)]],
+    device const bfloat* v_cache  [[buffer(2)]],
+    device bfloat* out            [[buffer(3)]],
     constant uint& num_heads      [[buffer(4)]],
     constant uint& num_kv_heads   [[buffer(5)]],
     constant uint& head_dim       [[buffer(6)]],
@@ -411,8 +402,7 @@ kernel void sdpa_decode_bf16(
     float scale = 1.0f / sqrt(float(head_dim));
     uint kv_stride = num_kv_heads * head_dim;
 
-    // Compute attention scores and find max
-    float scores[1024];  // max seq_len supported
+    float scores[1024];
     float max_s = -1e30f;
     for (uint t = 0; t < seq_len && t < 1024; t++) {
         float s = 0.0f;
@@ -425,14 +415,12 @@ kernel void sdpa_decode_bf16(
         if (s > max_s) max_s = s;
     }
 
-    // Softmax
     float sum_exp = 0.0f;
     for (uint t = 0; t < seq_len && t < 1024; t++) {
         scores[t] = exp(scores[t] - max_s);
         sum_exp += scores[t];
     }
 
-    // Weighted sum of V → output
     for (uint d = 0; d < head_dim; d++) {
         float v = 0.0f;
         for (uint t = 0; t < seq_len && t < 1024; t++) {
@@ -445,7 +433,7 @@ kernel void sdpa_decode_bf16(
 """
 
 // ============================================================================
-// MARK: - Weight Loading Infrastructure
+// MARK: - Weight Loading
 // ============================================================================
 
 struct TensorInfo {
@@ -470,10 +458,6 @@ func loadTensorToBuffer(_ device: MTLDevice, _ mmaps: [UnsafeRawPointer],
     let src = mmaps[info.fileIdx] + info.byteOffset
     return device.makeBuffer(bytes: src, length: info.byteSize, options: .storageModeShared)!
 }
-
-// ============================================================================
-// MARK: - Layer Weight Structures
-// ============================================================================
 
 struct AttnLayerWeights {
     var inputNormWeight: MTLBuffer?
@@ -512,9 +496,7 @@ struct GDNLayerWeights {
 let device = MTLCreateSystemDefaultDevice()!
 let queue = device.makeCommandQueue()!
 print("Device: \(device.name)")
-print("Max buffer: \(device.maxBufferLength / 1024 / 1024) MB")
 
-// Load metallib (NAX kernel)
 let mlxMetalPath = String(cString: getenv("HOME")) +
     "/.mlx-env/lib/python3.11/site-packages/mlx/lib/mlx.metallib"
 guard let mlxLib = try? device.makeLibrary(URL: URL(fileURLWithPath: mlxMetalPath)) else {
@@ -526,7 +508,6 @@ guard let naxFn = try? mlxLib.makeFunction(name: naxKernelName) else {
 }
 let naxPSO = try! device.makeComputePipelineState(function: naxFn)
 
-// Custom kernels
 let customLib = try! device.makeLibrary(source: metalSource, options: nil)
 func makePSO(_ name: String) -> MTLComputePipelineState {
     let fn = customLib.makeFunction(name: name)!
@@ -575,11 +556,8 @@ for path in shardFiles {
 print("mmap'd \(shardFiles.count) shard files")
 
 // ============================================================================
-// MARK: - Persistent Weights (embed + final_norm)
+// MARK: - Persistent Weights
 // ============================================================================
-
-print("\nLoading persistent weights...")
-let tLoadStart = CFAbsoluteTimeGetCurrent()
 
 let embedInfo = index["embed_tokens"] as! [String: Any]
 let embedW = loadTensorToBuffer(device, mmaps, parseTensorInfo(embedInfo["weight"] as! [String: Any]))
@@ -588,11 +566,7 @@ let embedB = loadTensorToBuffer(device, mmaps, parseTensorInfo(embedInfo["biases
 
 let finalNormInfo = index["final_norm"] as! [String: Any]
 let finalNormW = loadTensorToBuffer(device, mmaps, parseTensorInfo(finalNormInfo["weight"] as! [String: Any]))
-
-let embedMB = (embedW.length + embedS.length + embedB.length) / 1024 / 1024
-print("  Embed: \(embedMB) MB")
-print("  Final norm: \(finalNormW.length / 1024) KB")
-print("  Loaded in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - tLoadStart))s")
+print("Persistent weights loaded")
 
 // ============================================================================
 // MARK: - Activation Buffers
@@ -602,7 +576,6 @@ let hiddenBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageMode
 let normedBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageModeShared)!
 let residualBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageModeShared)!
 
-// Full attention buffers
 let qBuf = device.makeBuffer(length: NUM_HEADS * HEAD_DIM * 2 * 2, options: .storageModeShared)!
 let queriesBuf = device.makeBuffer(length: NUM_HEADS * HEAD_DIM * 2, options: .storageModeShared)!
 let attnGateBuf = device.makeBuffer(length: NUM_HEADS * HEAD_DIM * 2, options: .storageModeShared)!
@@ -614,7 +587,6 @@ let attnOutBuf = device.makeBuffer(length: NUM_HEADS * HEAD_DIM * 2, options: .s
 let gatedBuf = device.makeBuffer(length: NUM_HEADS * HEAD_DIM * 2, options: .storageModeShared)!
 let oOutBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageModeShared)!
 
-// GDN buffers
 let qkvBuf = device.makeBuffer(length: GDN_CONV_DIM * 2, options: .storageModeShared)!
 let zBuf = device.makeBuffer(length: GDN_VALUE_DIM * 2, options: .storageModeShared)!
 let aBuf = device.makeBuffer(length: GDN_NUM_V_HEADS * 2, options: .storageModeShared)!
@@ -631,45 +603,29 @@ let gdnYBuf = device.makeBuffer(length: GDN_VALUE_DIM * 2, options: .storageMode
 let gdnNormedBuf = device.makeBuffer(length: GDN_VALUE_DIM * 2, options: .storageModeShared)!
 let gdnOutProjBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageModeShared)!
 
-// MLP buffers (shared between attn and GDN layers)
 let gateProjBuf = device.makeBuffer(length: INTERMEDIATE_SIZE * 2, options: .storageModeShared)!
 let upProjBuf = device.makeBuffer(length: INTERMEDIATE_SIZE * 2, options: .storageModeShared)!
 let mlpHiddenBuf = device.makeBuffer(length: INTERMEDIATE_SIZE * 2, options: .storageModeShared)!
 let downProjBuf = device.makeBuffer(length: HIDDEN_SIZE * 2, options: .storageModeShared)!
 
-// Logits + argmax
 let logitsBuf = device.makeBuffer(length: VOCAB_SIZE * 2, options: .storageModeShared)!
 let argmaxBuf = device.makeBuffer(length: 4, options: .storageModeShared)!
 
-// RoPE cache
 let ropeCosBuf = device.makeBuffer(length: ROTARY_DIM / 2 * 4, options: .storageModeShared)!
 let ropeSinBuf = device.makeBuffer(length: ROTARY_DIM / 2 * 4, options: .storageModeShared)!
 
 // ============================================================================
-// MARK: - GDN Persistent State (48 layers)
+// MARK: - GDN State
 // ============================================================================
 
-let convStateBytes = (GDN_CONV_KERNEL - 1) * GDN_CONV_DIM * 2  // 3 * 10240 * 2 = 61440
-let deltaStateBytes = GDN_STATE_SIZE * 4                         // 48*128*128 * 4 = 3145728
+let convStateBytes = (GDN_CONV_KERNEL - 1) * GDN_CONV_DIM * 2
+let deltaStateBytes = GDN_STATE_SIZE * 4
 
-// Two conv state buffers for double-buffering (A = current, B = new)
 let numGDNLayers = 48
 let convStateA = device.makeBuffer(length: convStateBytes * numGDNLayers, options: .storageModeShared)!
 let convStateB = device.makeBuffer(length: convStateBytes * numGDNLayers, options: .storageModeShared)!
-// Delta state: single buffer, updated in-place
 let deltaState = device.makeBuffer(length: deltaStateBytes * numGDNLayers, options: .storageModeShared)!
 
-// Initialize all state to zeros
-memset(convStateA.contents(), 0, convStateA.length)
-memset(convStateB.contents(), 0, convStateB.length)
-memset(deltaState.contents(), 0, deltaState.length)
-
-let stateMB = (convStateA.length * 2 + deltaState.length) / 1024 / 1024
-print("\nGDN state allocated: \(stateMB) MB (\(numGDNLayers) layers)")
-print("  Conv state: \(convStateBytes * numGDNLayers / 1024) KB per buffer")
-print("  Delta state: \(deltaStateBytes * numGDNLayers / 1024 / 1024) MB")
-
-// Map from layer index to GDN index (0-47)
 var gdnLayerIndex: [Int: Int] = [:]
 var gdnIdx = 0
 for i in 0..<NUM_LAYERS {
@@ -679,7 +635,6 @@ for i in 0..<NUM_LAYERS {
     }
 }
 
-// Map from layer index to attention cache index (0-15)
 var attnLayerIndex: [Int: Int] = [:]
 var attnIdx = 0
 for i in 0..<NUM_LAYERS {
@@ -690,22 +645,19 @@ for i in 0..<NUM_LAYERS {
 }
 
 // ============================================================================
-// MARK: - KV Cache (16 attention layers)
+// MARK: - KV Cache
 // ============================================================================
 
 let MAX_SEQ: Int = 1024
-let kvTokenBytes = NUM_KV_HEADS * HEAD_DIM * 2  // 4 * 256 * 2 = 2048 bytes per token
-let kvLayerBytes = MAX_SEQ * kvTokenBytes         // 262144 bytes per layer
+let kvTokenBytes = NUM_KV_HEADS * HEAD_DIM * 2
+let kvLayerBytes = MAX_SEQ * kvTokenBytes
 let numAttnLayers = 16
 
 let kCache = device.makeBuffer(length: kvLayerBytes * numAttnLayers, options: .storageModeShared)!
 let vCache = device.makeBuffer(length: kvLayerBytes * numAttnLayers, options: .storageModeShared)!
-memset(kCache.contents(), 0, kCache.length)
-memset(vCache.contents(), 0, vCache.length)
-print("KV cache: \(kCache.length * 2 / 1024) KB (\(numAttnLayers) layers × \(MAX_SEQ) tokens)")
 
 // ============================================================================
-// MARK: - Helper: dispatch quantized matmul
+// MARK: - Helpers (same as full_forward.swift)
 // ============================================================================
 
 func dispatchQMatmul(_ enc: MTLComputeCommandEncoder,
@@ -727,10 +679,6 @@ func dispatchQMatmul(_ enc: MTLComputeCommandEncoder,
         threadsPerThreadgroup: MTLSize(width: 32, height: 2, depth: 2))
 }
 
-// ============================================================================
-// MARK: - Helper: RoPE precompute
-// ============================================================================
-
 func precomputeRoPE(position: Int) {
     let cosPtr = ropeCosBuf.contents().bindMemory(to: Float.self, capacity: ROTARY_DIM / 2)
     let sinPtr = ropeSinBuf.contents().bindMemory(to: Float.self, capacity: ROTARY_DIM / 2)
@@ -743,7 +691,7 @@ func precomputeRoPE(position: Int) {
 }
 
 // ============================================================================
-// MARK: - Layer Weight Loading (streaming from mmap)
+// MARK: - Layer Loading (same as full_forward.swift)
 // ============================================================================
 
 func loadAttnLayer(_ layerIdx: Int) -> AttnLayerWeights {
@@ -822,7 +770,7 @@ func loadGDNLayer(_ layerIdx: Int) -> GDNLayerWeights {
 }
 
 // ============================================================================
-// MARK: - Dispatch: Full Attention Layer
+// MARK: - Layer Dispatch (same as full_forward.swift)
 // ============================================================================
 
 func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
@@ -831,7 +779,6 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     var eps = RMS_NORM_EPS
     var count = UInt32(HIDDEN_SIZE)
 
-    // 1. Input RMS Norm
     enc.setComputePipelineState(rmsNormPSO)
     enc.setBuffer(hiddenBuf, offset: 0, index: 0)
     enc.setBuffer(lw.inputNormWeight!, offset: 0, index: 1)
@@ -841,12 +788,10 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: 256, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 2. Q projection (12288 = 24 * 256 * 2, interleaved Q+gate)
     dispatchQMatmul(enc, lw.qProjW!, lw.qProjS!, lw.qProjB!,
                     normedBuf, qBuf,
                     K_dim: HIDDEN_SIZE, N_dim: NUM_HEADS * HEAD_DIM * 2, M_dim: 1)
 
-    // 2b. Split Q+gate
     enc.setComputePipelineState(splitQGatePSO)
     enc.setBuffer(qBuf, offset: 0, index: 0)
     enc.setBuffer(queriesBuf, offset: 0, index: 1)
@@ -858,17 +803,14 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: HEAD_DIM, height: NUM_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 3. K projection
     dispatchQMatmul(enc, lw.kProjW!, lw.kProjS!, lw.kProjB!,
                     normedBuf, kBuf,
                     K_dim: HIDDEN_SIZE, N_dim: NUM_KV_HEADS * HEAD_DIM, M_dim: 1)
 
-    // 4. V projection
     dispatchQMatmul(enc, lw.vProjW!, lw.vProjS!, lw.vProjB!,
                     normedBuf, vBuf,
                     K_dim: HIDDEN_SIZE, N_dim: NUM_KV_HEADS * HEAD_DIM, M_dim: 1)
 
-    // 5. Per-head QK norm
     enc.setComputePipelineState(perHeadRmsNormPSO)
     enc.setBuffer(queriesBuf, offset: 0, index: 0)
     enc.setBuffer(lw.qNormWeight!, offset: 0, index: 1)
@@ -889,7 +831,6 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: HEAD_DIM, height: NUM_KV_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: HEAD_DIM, height: 1, depth: 1))
 
-    // 6. RoPE
     enc.setComputePipelineState(ropePSO)
     enc.setBuffer(qNormedBuf, offset: 0, index: 0)
     enc.setBuffer(ropeCosBuf, offset: 0, index: 1)
@@ -906,7 +847,6 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: ROTARY_DIM / 2, height: NUM_KV_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-    // 7a. Append K to cache at current position
     let cacheLayerOffset = attnIdx * kvLayerBytes
     let cacheTokenOffset = cacheLayerOffset + position * kvTokenBytes
     enc.setComputePipelineState(copyPSO)
@@ -917,13 +857,11 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: NUM_KV_HEADS * HEAD_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 7b. Append V to cache
     enc.setBuffer(vBuf, offset: 0, index: 0)
     enc.setBuffer(vCache, offset: cacheTokenOffset, index: 1)
     enc.dispatchThreads(MTLSize(width: NUM_KV_HEADS * HEAD_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 7c. Scaled dot-product attention with KV cache
     enc.setComputePipelineState(sdpaPSO)
     enc.setBuffer(qNormedBuf, offset: 0, index: 0)
     enc.setBuffer(kCache, offset: cacheLayerOffset, index: 1)
@@ -937,7 +875,6 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: NUM_HEADS, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: NUM_HEADS, height: 1, depth: 1))
 
-    // 8. Output gate: gated = attn_out * sigmoid(gate)
     enc.setComputePipelineState(sigmoidMulPSO)
     enc.setBuffer(attnOutBuf, offset: 0, index: 0)
     enc.setBuffer(attnGateBuf, offset: 0, index: 1)
@@ -947,12 +884,10 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: NUM_HEADS * HEAD_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 9. O projection
     dispatchQMatmul(enc, lw.oProjW!, lw.oProjS!, lw.oProjB!,
                     gatedBuf, oOutBuf,
                     K_dim: NUM_HEADS * HEAD_DIM, N_dim: HIDDEN_SIZE, M_dim: 1)
 
-    // 10. Residual
     enc.setComputePipelineState(residualPSO)
     enc.setBuffer(hiddenBuf, offset: 0, index: 0)
     enc.setBuffer(oOutBuf, offset: 0, index: 1)
@@ -961,7 +896,6 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: HIDDEN_SIZE, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 11. Post-attention norm
     enc.setComputePipelineState(rmsNormPSO)
     enc.setBuffer(residualBuf, offset: 0, index: 0)
     enc.setBuffer(lw.postNormWeight!, offset: 0, index: 1)
@@ -971,12 +905,10 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: 256, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 12-15. MLP
     dispatchMLP(enc, lw.gateProjW!, lw.gateProjS!, lw.gateProjB!,
                 lw.upProjW!, lw.upProjS!, lw.upProjB!,
                 lw.downProjW!, lw.downProjS!, lw.downProjB!)
 
-    // 16. Final residual → hiddenBuf
     enc.setComputePipelineState(residualPSO)
     enc.setBuffer(residualBuf, offset: 0, index: 0)
     enc.setBuffer(downProjBuf, offset: 0, index: 1)
@@ -985,10 +917,6 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: HIDDEN_SIZE, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 }
-
-// ============================================================================
-// MARK: - Dispatch: GDN Layer
-// ============================================================================
 
 func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
                       gdnIdx: Int, useConvA: Bool) {
@@ -1001,7 +929,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     var eps = RMS_NORM_EPS
     var count = UInt32(HIDDEN_SIZE)
 
-    // 1. Input norm
     enc.setComputePipelineState(rmsNormPSO)
     enc.setBuffer(hiddenBuf, offset: 0, index: 0)
     enc.setBuffer(lw.inputNormWeight!, offset: 0, index: 1)
@@ -1011,7 +938,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: 256, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 2. Projections
     dispatchQMatmul(enc, lw.qkvProjW!, lw.qkvProjS!, lw.qkvProjB!,
                     normedBuf, qkvBuf, K_dim: HIDDEN_SIZE, N_dim: GDN_CONV_DIM, M_dim: 1)
     dispatchQMatmul(enc, lw.zProjW!, lw.zProjS!, lw.zProjB!,
@@ -1021,7 +947,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     dispatchQMatmul(enc, lw.aProjW!, lw.aProjS!, lw.aProjB!,
                     normedBuf, aBuf, K_dim: HIDDEN_SIZE, N_dim: GDN_NUM_V_HEADS, M_dim: 1)
 
-    // 3. Depthwise conv1d
     enc.setComputePipelineState(depthwiseConvPSO)
     enc.setBuffer(convStateRead, offset: convOffset, index: 0)
     enc.setBuffer(qkvBuf, offset: 0, index: 1)
@@ -1033,7 +958,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: GDN_CONV_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 4. SiLU
     enc.setComputePipelineState(siluPSO)
     enc.setBuffer(convOutBuf, offset: 0, index: 0)
     enc.setBuffer(convSiluBuf, offset: 0, index: 1)
@@ -1041,9 +965,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: GDN_CONV_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 5. Q/K/V split is implicit — use offsets into convSiluBuf
-
-    // 6. QK norm with scale
     enc.setComputePipelineState(perHeadRmsNormScaledPSO)
     enc.setBuffer(convSiluBuf, offset: 0, index: 0)
     enc.setBuffer(gdnQNormedBuf, offset: 0, index: 1)
@@ -1058,7 +979,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_K_DIM, height: GDN_NUM_K_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: GDN_HEAD_K_DIM, height: 1, depth: 1))
 
-    // K norm
     enc.setBuffer(convSiluBuf, offset: GDN_KEY_DIM * 2, index: 0)
     enc.setBuffer(gdnKNormedBuf, offset: 0, index: 1)
     var kScale: Float = GDN_INV_SCALE
@@ -1066,7 +986,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_K_DIM, height: GDN_NUM_K_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: GDN_HEAD_K_DIM, height: 1, depth: 1))
 
-    // 7. Expand K heads (16 → 48)
     var nvh = UInt32(GDN_NUM_V_HEADS)
     enc.setComputePipelineState(expandKvPSO)
     enc.setBuffer(gdnQNormedBuf, offset: 0, index: 0)
@@ -1082,7 +1001,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_K_DIM, height: GDN_NUM_V_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
 
-    // 8. Compute g and beta
     enc.setComputePipelineState(computeGBetaPSO)
     enc.setBuffer(aBuf, offset: 0, index: 0)
     enc.setBuffer(bBuf, offset: 0, index: 1)
@@ -1094,11 +1012,10 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: GDN_NUM_V_HEADS, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 48, height: 1, depth: 1))
 
-    // 9. Gated delta step
     enc.setComputePipelineState(gdnStepPSO)
     enc.setBuffer(gdnQExpandedBuf, offset: 0, index: 0)
     enc.setBuffer(gdnKExpandedBuf, offset: 0, index: 1)
-    enc.setBuffer(convSiluBuf, offset: GDN_KEY_DIM * 2 * 2, index: 2)  // V starts after Q+K
+    enc.setBuffer(convSiluBuf, offset: GDN_KEY_DIM * 2 * 2, index: 2)
     enc.setBuffer(gBuf, offset: 0, index: 3)
     enc.setBuffer(betaBuf, offset: 0, index: 4)
     enc.setBuffer(deltaState, offset: deltaOffset, index: 5)
@@ -1110,7 +1027,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_V_DIM, height: GDN_NUM_V_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
 
-    // 10. RMSNormGated
     enc.setComputePipelineState(rmsNormGatedPSO)
     enc.setBuffer(gdnYBuf, offset: 0, index: 0)
     enc.setBuffer(zBuf, offset: 0, index: 1)
@@ -1122,11 +1038,9 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_V_DIM, height: GDN_NUM_V_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
 
-    // 11. Out projection
     dispatchQMatmul(enc, lw.outProjW!, lw.outProjS!, lw.outProjB!,
                     gdnNormedBuf, gdnOutProjBuf, K_dim: GDN_VALUE_DIM, N_dim: HIDDEN_SIZE, M_dim: 1)
 
-    // 12. Residual
     enc.setComputePipelineState(residualPSO)
     enc.setBuffer(hiddenBuf, offset: 0, index: 0)
     enc.setBuffer(gdnOutProjBuf, offset: 0, index: 1)
@@ -1135,7 +1049,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: HIDDEN_SIZE, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 13. Post-attention norm
     enc.setComputePipelineState(rmsNormPSO)
     enc.setBuffer(residualBuf, offset: 0, index: 0)
     enc.setBuffer(lw.postNormWeight!, offset: 0, index: 1)
@@ -1145,12 +1058,10 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: 256, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 14. MLP
     dispatchMLP(enc, lw.gateProjW!, lw.gateProjS!, lw.gateProjB!,
                 lw.upProjW!, lw.upProjS!, lw.upProjB!,
                 lw.downProjW!, lw.downProjS!, lw.downProjB!)
 
-    // 15. Final residual → hiddenBuf
     enc.setComputePipelineState(residualPSO)
     enc.setBuffer(residualBuf, offset: 0, index: 0)
     enc.setBuffer(downProjBuf, offset: 0, index: 1)
@@ -1159,10 +1070,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: HIDDEN_SIZE, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 }
-
-// ============================================================================
-// MARK: - Dispatch: MLP (shared between attn and GDN)
-// ============================================================================
 
 func dispatchMLP(_ enc: MTLComputeCommandEncoder,
                  _ gateW: MTLBuffer, _ gateS: MTLBuffer, _ gateB: MTLBuffer,
@@ -1190,16 +1097,15 @@ func dispatchMLP(_ enc: MTLComputeCommandEncoder,
 }
 
 // ============================================================================
-// MARK: - Full Forward Pass
+// MARK: - Forward Pass (FIXED: no double-processing of last prompt token)
 // ============================================================================
 
-var convStateFlip = true  // true = read A write B, false = read B write A
+var convStateFlip = true
 
-func forwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId: Int, timeMs: Double) {
-    let tStart = CFAbsoluteTimeGetCurrent()
+func forwardPass(tokenId: Int, position: Int) -> Int {
     precomputeRoPE(position: position)
 
-    // --- Embedding ---
+    // Embedding
     let cbEmbed = queue.makeCommandBuffer()!
     let encEmbed = cbEmbed.makeComputeCommandEncoder()!
     encEmbed.setComputePipelineState(embedPSO)
@@ -1219,10 +1125,8 @@ func forwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId
     cbEmbed.commit()
     cbEmbed.waitUntilCompleted()
 
-    // --- 64 Layers (streaming weights) ---
+    // 64 Layers
     for layerIdx in 0..<NUM_LAYERS {
-        let tLayer = CFAbsoluteTimeGetCurrent()
-
         let cb = queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
 
@@ -1241,27 +1145,15 @@ func forwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId
 
         if cb.status == .error {
             print("ERROR at layer \(layerIdx): \(cb.error?.localizedDescription ?? "unknown")")
-            return (-1, 0)
-        }
-
-        if verbose {
-            let layerMs = (CFAbsoluteTimeGetCurrent() - tLayer) * 1000
-            let layerType = isFullAttn(layerIdx) ? "ATTN" : "GDN"
-            if layerIdx < 4 || layerIdx >= 60 || layerIdx % 16 == 0 {
-                print("  Layer \(String(format: "%2d", layerIdx)) [\(layerType)]: \(String(format: "%.1f", layerMs))ms")
-            } else if layerIdx == 4 {
-                print("  ...")
-            }
+            return -1
         }
     }
 
-    // Swap conv state for next pass
     convStateFlip = !convStateFlip
 
-    // --- Final norm ---
+    // Final norm
     let cbFinal = queue.makeCommandBuffer()!
     let encFinal = cbFinal.makeComputeCommandEncoder()!
-
     encFinal.setComputePipelineState(rmsNormPSO)
     encFinal.setBuffer(hiddenBuf, offset: 0, index: 0)
     encFinal.setBuffer(finalNormW, offset: 0, index: 1)
@@ -1276,7 +1168,7 @@ func forwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId
     cbFinal.commit()
     cbFinal.waitUntilCompleted()
 
-    // --- lm_head (stream from mmap) ---
+    // lm_head
     let lmHeadInfo = index["lm_head"] as! [String: Any]
     let lmW = loadTensorToBuffer(device, mmaps, parseTensorInfo(lmHeadInfo["weight"] as! [String: Any]))
     let lmS = loadTensorToBuffer(device, mmaps, parseTensorInfo(lmHeadInfo["scales"] as! [String: Any]))
@@ -1288,7 +1180,6 @@ func forwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId
                     normedBuf, logitsBuf,
                     K_dim: HIDDEN_SIZE, N_dim: VOCAB_SIZE, M_dim: 1)
 
-    // Argmax
     encLm.setComputePipelineState(argmaxPSO)
     encLm.setBuffer(logitsBuf, offset: 0, index: 0)
     encLm.setBuffer(argmaxBuf, offset: 0, index: 1)
@@ -1302,155 +1193,139 @@ func forwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId
     cbLm.waitUntilCompleted()
 
     let result = argmaxBuf.contents().bindMemory(to: UInt32.self, capacity: 1)
-    let totalMs = (CFAbsoluteTimeGetCurrent() - tStart) * 1000
-
-    return (Int(result[0]), totalMs)
+    return Int(result[0])
 }
 
 // ============================================================================
-// MARK: - Autoregressive Generation (prompt from file or single token)
+// MARK: - Reset State (between test prompts)
 // ============================================================================
 
-// Check for prompt file argument
-var promptTokens: [Int] = []
-var maxGenerate = 300
-
-let promptPath = "/Users/midas/Desktop/cowork/inference-across-metal/overnight_prompt_tokens.json"
-if FileManager.default.fileExists(atPath: promptPath) {
-    let data = try! Data(contentsOf: URL(fileURLWithPath: promptPath))
-    let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
-    promptTokens = (obj["tokens"] as! [Any]).map { ($0 as! NSNumber).intValue }
-    maxGenerate = (obj["max_generate"] as? NSNumber)?.intValue ?? 300
-    print("\nLoaded prompt: \(promptTokens.count) tokens, max_generate=\(maxGenerate)")
-    print("Source: \(obj["source"] as? String ?? "unknown")")
-} else {
-    // Fallback: single "Hello" token
-    promptTokens = [9419]
-    maxGenerate = 75
-    print("\nNo prompt file found, using Hello token")
+func resetAllState() {
+    memset(convStateA.contents(), 0, convStateA.length)
+    memset(convStateB.contents(), 0, convStateB.length)
+    memset(deltaState.contents(), 0, deltaState.length)
+    memset(kCache.contents(), 0, kCache.length)
+    memset(vCache.contents(), 0, vCache.length)
+    convStateFlip = true
 }
 
-let totalSteps = promptTokens.count + maxGenerate
+// ============================================================================
+// MARK: - Run Test: prefill prompt, generate N tokens
+// ============================================================================
 
-print("\n" + String(repeating: "=", count: 60))
-print("Autoregressive Generation — Qwen3.5-27B on M5 Air 16GB")
-print("Prompt: \(promptTokens.count) tokens, Generate: \(maxGenerate) tokens")
-print("Estimated time: \(totalSteps * 15 / 60) min")
-print(String(repeating: "=", count: 60))
+func runTest(name: String, promptTokens: [Int], maxGen: Int) -> [Int] {
+    resetAllState()
+    print("\n" + String(repeating: "=", count: 60))
+    print("TEST: \(name)")
+    print("Prompt tokens (\(promptTokens.count)): \(promptTokens)")
+    print(String(repeating: "=", count: 60))
 
-var allTokens: [Int] = promptTokens
-var generatedTokens: [Int] = []
+    let tStart = CFAbsoluteTimeGetCurrent()
 
-let tGenStart = CFAbsoluteTimeGetCurrent()
-
-// --- Phase 1: Prefill (process prompt tokens) ---
-var lastPrefillToken: Int = -1
-if promptTokens.count > 1 {
-    print("\nPhase 1: Prefill (\(promptTokens.count) tokens)...")
+    // Phase 1: Prefill — process all prompt tokens, building state
+    // The output of each prefill step is discarded (we only need the state)
+    // EXCEPT for the last token, whose output is the first generated token
+    print("  Prefill...")
+    var firstGenToken = -1
     for (i, token) in promptTokens.enumerated() {
-        let position = i
-        let (nextToken, stepMs) = forwardPass(tokenId: token, position: position)
-        lastPrefillToken = nextToken  // capture last one as first generated token
-
-        if i < 3 || i == promptTokens.count - 1 || i % 50 == 0 {
-            let elapsed = CFAbsoluteTimeGetCurrent() - tGenStart
-            let pct = Double(i + 1) / Double(promptTokens.count) * 100
-            print("  Prefill \(String(format: "%3d", i+1))/\(promptTokens.count) " +
-                  "(\(String(format: "%.0f", pct))%) " +
-                  "[\(String(format: "%.1f", stepMs))ms, " +
-                  "\(String(format: "%.0f", elapsed))s elapsed]")
+        let nextTok = forwardPass(tokenId: token, position: i)
+        let elapsed = CFAbsoluteTimeGetCurrent() - tStart
+        print("  Prefill \(i+1)/\(promptTokens.count): token_in=\(token) -> token_out=\(nextTok) [\(String(format: "%.1f", elapsed))s]")
+        if i == promptTokens.count - 1 {
+            firstGenToken = nextTok
         }
     }
-    let prefillTime = CFAbsoluteTimeGetCurrent() - tGenStart
-    print("  Prefill complete: \(String(format: "%.0f", prefillTime))s " +
-          "(\(String(format: "%.1f", prefillTime / 60))min)")
-}
 
-// --- Phase 2: Generate ---
-print("\nPhase 2: Generate (\(maxGenerate) tokens)...")
-let tGenPhase = CFAbsoluteTimeGetCurrent()
+    // Phase 2: Generate
+    print("  Generate...")
+    var generated: [Int] = [firstGenToken]
+    var currentToken = firstGenToken
+    let genStartPos = promptTokens.count  // next position after prompt
 
-// Use the last prefill step's output as the first generated token
-// (the prefill loop already ran all prompt tokens and produced the next-token prediction)
-var currentToken: Int
-if promptTokens.count > 1 {
-    // lastPrefillToken was set by the prefill loop — no re-run needed
-    currentToken = lastPrefillToken
-} else {
-    let (firstGen, _) = forwardPass(tokenId: promptTokens[0], position: 0)
-    currentToken = firstGen
-}
-generatedTokens.append(currentToken)
-allTokens.append(currentToken)
+    for step in 0..<(maxGen - 1) {
+        let position = genStartPos + step
 
-let genStartPos = promptTokens.count
+        if position >= MAX_SEQ - 1 {
+            print("  KV cache full at position \(position)")
+            break
+        }
 
-for step in 1..<maxGenerate {
-    let position = genStartPos + step - 1
+        let nextToken = forwardPass(tokenId: currentToken, position: position)
 
-    if position >= MAX_SEQ - 1 {
-        print("  KV cache full at position \(position)")
-        break
+        if nextToken < 0 {
+            print("  ERROR at step \(step)")
+            break
+        }
+
+        generated.append(nextToken)
+        currentToken = nextToken
+
+        let elapsed = CFAbsoluteTimeGetCurrent() - tStart
+        print("  Gen \(step+2)/\(maxGen): token=\(nextToken) [\(String(format: "%.1f", elapsed))s]")
+
+        // Stop on EOS
+        if nextToken == 151643 || nextToken == 151645 {
+            print("  (EOS)")
+            break
+        }
     }
 
-    let (nextToken, stepMs) = forwardPass(tokenId: currentToken, position: position)
+    let totalTime = CFAbsoluteTimeGetCurrent() - tStart
+    print("  Total time: \(String(format: "%.0f", totalTime))s (\(String(format: "%.1f", totalTime / 60)) min)")
+    print("  Generated \(generated.count) tokens: \(generated)")
 
-    if nextToken < 0 {
-        print("ERROR: generation failed at step \(step)")
-        break
-    }
-
-    generatedTokens.append(nextToken)
-    allTokens.append(nextToken)
-    currentToken = nextToken
-
-    let elapsed = CFAbsoluteTimeGetCurrent() - tGenPhase
-    let tokPerSec = Double(step + 1) / elapsed
-    print("  Gen \(String(format: "%3d", step+1))/\(maxGenerate): " +
-          "token \(String(format: "%6d", nextToken))  " +
-          "[\(String(format: "%.1f", stepMs))ms, " +
-          "\(String(format: "%.3f", tokPerSec)) tok/s]")
-
-    // Stop on EOS
-    if nextToken == 151643 || nextToken == 151645 {
-        print("  (EOS)")
-        break
-    }
+    return generated
 }
 
-let tGenTotal = CFAbsoluteTimeGetCurrent() - tGenStart
-let genPhaseTime = CFAbsoluteTimeGetCurrent() - tGenPhase
+// ============================================================================
+// MARK: - Test Suite
+// ============================================================================
 
 print("\n" + String(repeating: "=", count: 60))
-print("GENERATION COMPLETE")
+print("KV CACHE + PREFILL CONTEXT VERIFICATION")
+print("Qwen3.5-27B on M5 Air 16GB — Sequential Prefill")
 print(String(repeating: "=", count: 60))
-print("Prompt tokens:    \(promptTokens.count)")
-print("Generated tokens: \(generatedTokens.count)")
-print("Total time:       \(String(format: "%.0f", tGenTotal))s (\(String(format: "%.1f", tGenTotal / 60))min)")
-if promptTokens.count > 1 {
-    let prefillTime = tGenTotal - genPhaseTime
-    print("  Prefill:        \(String(format: "%.0f", prefillTime))s")
-    print("  Generation:     \(String(format: "%.0f", genPhaseTime))s")
-}
-print("Gen tok/s:        \(String(format: "%.4f", Double(generatedTokens.count) / genPhaseTime))")
 
-// Save results
-let resultPath = "/Users/midas/Desktop/cowork/inference-across-metal/overnight_result.json"
-let resultDict: [String: Any] = [
-    "prompt_tokens": promptTokens.count,
-    "generated_tokens": generatedTokens.count,
-    "total_time_s": tGenTotal,
-    "generated_token_ids": generatedTokens,
-    "all_token_ids": allTokens,
+// Test 1: "The capital of France is" — should produce "Paris"
+// Tokens: [760, 6511, 314, 9338, 369]
+let test1Tokens = runTest(
+    name: "Capital of France",
+    promptTokens: [760, 6511, 314, 9338, 369],
+    maxGen: 10
+)
+
+// Test 2: "My name is Nick. What is my name?" — should reference "Nick"
+// Tokens: [4888, 803, 369, 14557, 13, 3437, 369, 821, 803, 30]
+let test2Tokens = runTest(
+    name: "Name recall (multi-turn context)",
+    promptTokens: [4888, 803, 369, 14557, 13, 3437, 369, 821, 803, 30],
+    maxGen: 10
+)
+
+// ============================================================================
+// MARK: - Results Summary
+// ============================================================================
+
+print("\n" + String(repeating: "=", count: 60))
+print("RESULTS SUMMARY")
+print(String(repeating: "=", count: 60))
+
+print("\nTest 1 - 'The capital of France is' -> generated token IDs: \(test1Tokens)")
+print("Test 2 - 'My name is Nick. What is my name?' -> generated token IDs: \(test2Tokens)")
+
+// Save results for decoding
+let results: [String: Any] = [
+    "test1_prompt": "The capital of France is",
+    "test1_tokens": test1Tokens,
+    "test2_prompt": "My name is Nick. What is my name?",
+    "test2_tokens": test2Tokens,
 ]
-let resultData = try! JSONSerialization.data(withJSONObject: resultDict, options: .prettyPrinted)
+let resultPath = "/Users/midas/Desktop/cowork/inference-across-metal/context_test_results.json"
+let resultData = try! JSONSerialization.data(withJSONObject: results, options: .prettyPrinted)
 try! resultData.write(to: URL(fileURLWithPath: resultPath))
 print("\nResults saved to: \(resultPath)")
 
-print("\nGenerated token IDs: \(generatedTokens)")
 print("\nDecode with:")
-print("python3 -c \"from transformers import AutoTokenizer; " +
-      "t=AutoTokenizer.from_pretrained('/Users/midas/models/Qwen3.5-27B-MLX-4bit'); " +
-      "print(t.decode(\(generatedTokens)))\"")
+print("~/.mlx-env/bin/python3 -c \"from transformers import AutoTokenizer; t=AutoTokenizer.from_pretrained('/Users/midas/models/Qwen3.5-27B-MLX-4bit'); print('Test1:', t.decode(\(test1Tokens))); print('Test2:', t.decode(\(test2Tokens)))\"")
 
 print("\nDone.")

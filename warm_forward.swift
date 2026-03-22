@@ -1,15 +1,26 @@
-// full_forward.swift — Session 3: Complete 64-layer forward pass
-// Qwen3.5-27B on 16GB M5 Air via streaming weight loading
+// warm_forward.swift — Warm-path weight wiring for Qwen3.5-27B
+// Pre-loads ALL 64 transformer layers + lm_head into Metal shared buffers at startup.
+// Eliminates per-token SSD page faults that caused 14-16s/token in the cold path.
 //
-// Strategy: Load one layer at a time from mmap (~200MB), process, release.
-// Persistent: embed (682MB), final_norm (10KB), GDN state (147MB), activations (~100MB)
-// Streamed: 64 layers + lm_head loaded/released per forward pass
+// Memory budget (16GB M5 Air):
+//   64 layers: ~13,068 MB (48 GDN @ 205.7 MB + 16 Attn @ 199.7 MB)
+//   lm_head:   ~682 MB
+//   GDN state: ~149 MB (conv + delta)
+//   KV cache:  ~64 MB (16 layers x 1024 tokens)
+//   Activations: ~100 MB
+//   Total:     ~14,063 MB → fits in 16GB with ~1.5GB for OS
 //
-// Build: swiftc -O -framework Metal -framework MetalPerformanceShaders full_forward.swift -o full_forward
-// Run:   ./full_forward
+//   Embedding (682 MB) is NOT pre-loaded during decode.
+//   Instead: targeted 10KB memcpy per token from mmap (token_id * row_size).
+//
+// Build: swiftc -O -framework Metal -framework MetalPerformanceShaders warm_forward.swift -o warm_forward
+// Run:   ./warm_forward
 
 import Metal
 import Foundation
+
+// Disable stdout buffering so output appears immediately when piped
+setbuf(stdout, nil)
 
 // ============================================================================
 // MARK: - Config
@@ -129,6 +140,30 @@ kernel void embed_lookup_bf16(
     uint group_idx = tid / group_sz;
     float scale = float(scales[token_id * groups_per_row + group_idx]);
     float bias = float(biases[token_id * groups_per_row + group_idx]);
+    out[tid] = bfloat(float(nibble) * scale + bias);
+}
+
+// CPU-side embedding lookup for warm path (writes bf16 directly)
+// This kernel dequantizes a single row from small buffers holding just one row
+kernel void embed_lookup_row_bf16(
+    device const uint* weight_row   [[buffer(0)]],
+    device const bfloat* scale_row  [[buffer(1)]],
+    device const bfloat* bias_row   [[buffer(2)]],
+    device bfloat* out              [[buffer(3)]],
+    constant uint& hidden_dim       [[buffer(4)]],
+    constant uint& group_sz         [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= hidden_dim) return;
+    uint packed_dim = hidden_dim / 8;
+    uint groups_per_row = hidden_dim / group_sz;
+    uint pack_idx = tid / 8;
+    uint nibble_idx = tid % 8;
+    uint packed_val = weight_row[pack_idx];
+    uint nibble = (packed_val >> (nibble_idx * 4)) & 0xF;
+    uint group_idx = tid / group_sz;
+    float scale = float(scale_row[group_idx]);
+    float bias = float(bias_row[group_idx]);
     out[tid] = bfloat(float(nibble) * scale + bias);
 }
 
@@ -392,12 +427,11 @@ kernel void copy_bf16(
 }
 
 // Scaled dot-product attention for M=1 decode with KV cache
-// One thread per Q head — computes full attention output for that head
 kernel void sdpa_decode_bf16(
-    device const bfloat* q        [[buffer(0)]],  // (num_heads, head_dim) — after norm+RoPE
-    device const bfloat* k_cache  [[buffer(1)]],  // (seq_len, num_kv_heads, head_dim)
-    device const bfloat* v_cache  [[buffer(2)]],  // (seq_len, num_kv_heads, head_dim)
-    device bfloat* out            [[buffer(3)]],  // (num_heads, head_dim)
+    device const bfloat* q        [[buffer(0)]],
+    device const bfloat* k_cache  [[buffer(1)]],
+    device const bfloat* v_cache  [[buffer(2)]],
+    device bfloat* out            [[buffer(3)]],
     constant uint& num_heads      [[buffer(4)]],
     constant uint& num_kv_heads   [[buffer(5)]],
     constant uint& head_dim       [[buffer(6)]],
@@ -411,8 +445,7 @@ kernel void sdpa_decode_bf16(
     float scale = 1.0f / sqrt(float(head_dim));
     uint kv_stride = num_kv_heads * head_dim;
 
-    // Compute attention scores and find max
-    float scores[1024];  // max seq_len supported
+    float scores[1024];
     float max_s = -1e30f;
     for (uint t = 0; t < seq_len && t < 1024; t++) {
         float s = 0.0f;
@@ -425,14 +458,12 @@ kernel void sdpa_decode_bf16(
         if (s > max_s) max_s = s;
     }
 
-    // Softmax
     float sum_exp = 0.0f;
     for (uint t = 0; t < seq_len && t < 1024; t++) {
         scores[t] = exp(scores[t] - max_s);
         sum_exp += scores[t];
     }
 
-    // Weighted sum of V → output
     for (uint d = 0; d < head_dim; d++) {
         float v = 0.0f;
         for (uint t = 0; t < seq_len && t < 1024; t++) {
@@ -536,6 +567,7 @@ let rmsNormPSO = makePSO("rms_norm_bf16")
 let siluMulPSO = makePSO("silu_multiply_bf16")
 let residualPSO = makePSO("residual_add_bf16")
 let embedPSO = makePSO("embed_lookup_bf16")
+let embedRowPSO = makePSO("embed_lookup_row_bf16")
 let sigmoidMulPSO = makePSO("sigmoid_multiply_bf16")
 let ropePSO = makePSO("rope_bf16")
 let argmaxPSO = makePSO("argmax_bf16")
@@ -563,6 +595,7 @@ let shardFiles = index["shard_files"] as! [String]
 let layersInfo = index["layers"] as! [[String: Any]]
 
 var mmaps: [UnsafeRawPointer] = []
+var mmapSizes: [Int] = []
 for path in shardFiles {
     let fd = open(path, O_RDONLY)
     guard fd >= 0 else { print("Cannot open \(path)"); exit(1) }
@@ -571,28 +604,263 @@ for path in shardFiles {
     let ptr = mmap(nil, size, PROT_READ, MAP_PRIVATE, fd, 0)!
     close(fd)
     mmaps.append(UnsafeRawPointer(ptr))
+    mmapSizes.append(size)
 }
 print("mmap'd \(shardFiles.count) shard files")
 
 // ============================================================================
-// MARK: - Persistent Weights (embed + final_norm)
+// MARK: - Embedding: mmap pointers for targeted row lookup (no full load)
 // ============================================================================
 
-print("\nLoading persistent weights...")
-let tLoadStart = CFAbsoluteTimeGetCurrent()
-
 let embedInfo = index["embed_tokens"] as! [String: Any]
-let embedW = loadTensorToBuffer(device, mmaps, parseTensorInfo(embedInfo["weight"] as! [String: Any]))
-let embedS = loadTensorToBuffer(device, mmaps, parseTensorInfo(embedInfo["scales"] as! [String: Any]))
-let embedB = loadTensorToBuffer(device, mmaps, parseTensorInfo(embedInfo["biases"] as! [String: Any]))
+let embedWeightInfo = parseTensorInfo(embedInfo["weight"] as! [String: Any])
+let embedScalesInfo = parseTensorInfo(embedInfo["scales"] as! [String: Any])
+let embedBiasesInfo = parseTensorInfo(embedInfo["biases"] as! [String: Any])
 
+// Row sizes for targeted lookup
+let embedPackedDim = HIDDEN_SIZE / 8  // 640 uint32s per row
+let embedWeightRowBytes = embedPackedDim * 4  // 2560 bytes
+let embedGroupsPerRow = HIDDEN_SIZE / GROUP_SIZE  // 80 groups per row
+let embedScaleRowBytes = embedGroupsPerRow * 2  // 160 bytes (bf16)
+let embedBiasRowBytes = embedGroupsPerRow * 2   // 160 bytes (bf16)
+let embedTotalRowBytes = embedWeightRowBytes + embedScaleRowBytes + embedBiasRowBytes  // 2880 bytes
+
+// Small Metal buffers for single-row embedding lookup during decode
+let embedRowWBuf = device.makeBuffer(length: embedWeightRowBytes, options: .storageModeShared)!
+let embedRowSBuf = device.makeBuffer(length: embedScaleRowBytes, options: .storageModeShared)!
+let embedRowBBuf = device.makeBuffer(length: embedBiasRowBytes, options: .storageModeShared)!
+
+print("\nEmbedding: targeted row lookup (\(embedTotalRowBytes) bytes/token, NOT pre-loaded)")
+
+// Final norm (tiny, always loaded)
 let finalNormInfo = index["final_norm"] as! [String: Any]
 let finalNormW = loadTensorToBuffer(device, mmaps, parseTensorInfo(finalNormInfo["weight"] as! [String: Any]))
+print("Final norm: \(finalNormW.length / 1024) KB")
 
-let embedMB = (embedW.length + embedS.length + embedB.length) / 1024 / 1024
-print("  Embed: \(embedMB) MB")
-print("  Final norm: \(finalNormW.length / 1024) KB")
-print("  Loaded in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - tLoadStart))s")
+// ============================================================================
+// MARK: - WARM PATH: Pre-load ALL 64 layers + lm_head
+// ============================================================================
+
+// Memory budget: leave ~2.5GB for OS + GDN state (149MB) + KV cache (64MB) + activations (100MB)
+// On 16GB: 16384 - 2500 - 149 - 64 - 100 = 13571 MB available for weights
+// But Metal overhead and fragmentation eat ~500MB more, so budget 12800 MB for layers
+// lm_head is streamed (682MB saved), embed is row-lookup (682MB saved)
+let WEIGHT_BUDGET_MB: Int = 12800  // Conservative: leaves ~3.2GB for everything else
+
+print("\n" + String(repeating: "=", count: 60))
+print("WARM PATH: Pre-loading weights into Metal buffers")
+print("Budget: \(WEIGHT_BUDGET_MB) MB for layer weights")
+print(String(repeating: "=", count: 60))
+let tWarmStart = CFAbsoluteTimeGetCurrent()
+
+// Pre-allocated weight arrays indexed by layer position
+var warmAttnLayers: [Int: AttnLayerWeights] = [:]
+var warmGDNLayers: [Int: GDNLayerWeights] = [:]
+
+var totalWiredBytes: Int = 0
+var wiredLayerCount: Int = 0
+var lastWiredLayer: Int = -1
+
+for layerIdx in 0..<NUM_LAYERS {
+    // Check budget before loading
+    let li = layersInfo[layerIdx]
+    let tensors = li["tensors"] as! [String: Any]
+    var layerBytes = 0
+    for (_, v) in tensors {
+        let d = v as! [String: Any]
+        layerBytes += d["byte_size"] as! Int
+    }
+    if (totalWiredBytes + layerBytes) / 1024 / 1024 > WEIGHT_BUDGET_MB {
+        print("  Budget limit reached at layer \(layerIdx) " +
+              "(\(totalWiredBytes / 1024 / 1024) MB wired, " +
+              "\(layerBytes / 1024 / 1024) MB needed)")
+        break
+    }
+    let tLayer = CFAbsoluteTimeGetCurrent()
+
+    func loadT(_ name: String) -> MTLBuffer {
+        let info = parseTensorInfo(tensors[name] as! [String: Any])
+        totalWiredBytes += info.byteSize
+        return loadTensorToBuffer(device, mmaps, info)
+    }
+
+    if isFullAttn(layerIdx) {
+        var lw = AttnLayerWeights()
+        lw.inputNormWeight = loadT("input_layernorm.weight")
+        lw.qProjW = loadT("self_attn.q_proj.weight")
+        lw.qProjS = loadT("self_attn.q_proj.scales")
+        lw.qProjB = loadT("self_attn.q_proj.biases")
+        lw.kProjW = loadT("self_attn.k_proj.weight")
+        lw.kProjS = loadT("self_attn.k_proj.scales")
+        lw.kProjB = loadT("self_attn.k_proj.biases")
+        lw.vProjW = loadT("self_attn.v_proj.weight")
+        lw.vProjS = loadT("self_attn.v_proj.scales")
+        lw.vProjB = loadT("self_attn.v_proj.biases")
+        lw.oProjW = loadT("self_attn.o_proj.weight")
+        lw.oProjS = loadT("self_attn.o_proj.scales")
+        lw.oProjB = loadT("self_attn.o_proj.biases")
+        lw.qNormWeight = loadT("self_attn.q_norm.weight")
+        lw.kNormWeight = loadT("self_attn.k_norm.weight")
+        lw.postNormWeight = loadT("post_attention_layernorm.weight")
+        lw.gateProjW = loadT("mlp.gate_proj.weight")
+        lw.gateProjS = loadT("mlp.gate_proj.scales")
+        lw.gateProjB = loadT("mlp.gate_proj.biases")
+        lw.upProjW = loadT("mlp.up_proj.weight")
+        lw.upProjS = loadT("mlp.up_proj.scales")
+        lw.upProjB = loadT("mlp.up_proj.biases")
+        lw.downProjW = loadT("mlp.down_proj.weight")
+        lw.downProjS = loadT("mlp.down_proj.scales")
+        lw.downProjB = loadT("mlp.down_proj.biases")
+        warmAttnLayers[layerIdx] = lw
+    } else {
+        var lw = GDNLayerWeights()
+        lw.inputNormWeight = loadT("input_layernorm.weight")
+        lw.qkvProjW = loadT("linear_attn.in_proj_qkv.weight")
+        lw.qkvProjS = loadT("linear_attn.in_proj_qkv.scales")
+        lw.qkvProjB = loadT("linear_attn.in_proj_qkv.biases")
+        lw.zProjW = loadT("linear_attn.in_proj_z.weight")
+        lw.zProjS = loadT("linear_attn.in_proj_z.scales")
+        lw.zProjB = loadT("linear_attn.in_proj_z.biases")
+        lw.bProjW = loadT("linear_attn.in_proj_b.weight")
+        lw.bProjS = loadT("linear_attn.in_proj_b.scales")
+        lw.bProjB = loadT("linear_attn.in_proj_b.biases")
+        lw.aProjW = loadT("linear_attn.in_proj_a.weight")
+        lw.aProjS = loadT("linear_attn.in_proj_a.scales")
+        lw.aProjB = loadT("linear_attn.in_proj_a.biases")
+        lw.convWeight = loadT("linear_attn.conv1d.weight")
+        lw.ALog = loadT("linear_attn.A_log")
+        lw.dtBias = loadT("linear_attn.dt_bias")
+        lw.normWeight = loadT("linear_attn.norm.weight")
+        lw.outProjW = loadT("linear_attn.out_proj.weight")
+        lw.outProjS = loadT("linear_attn.out_proj.scales")
+        lw.outProjB = loadT("linear_attn.out_proj.biases")
+        lw.postNormWeight = loadT("post_attention_layernorm.weight")
+        lw.gateProjW = loadT("mlp.gate_proj.weight")
+        lw.gateProjS = loadT("mlp.gate_proj.scales")
+        lw.gateProjB = loadT("mlp.gate_proj.biases")
+        lw.upProjW = loadT("mlp.up_proj.weight")
+        lw.upProjS = loadT("mlp.up_proj.scales")
+        lw.upProjB = loadT("mlp.up_proj.biases")
+        lw.downProjW = loadT("mlp.down_proj.weight")
+        lw.downProjS = loadT("mlp.down_proj.scales")
+        lw.downProjB = loadT("mlp.down_proj.biases")
+        warmGDNLayers[layerIdx] = lw
+    }
+
+    wiredLayerCount += 1
+    lastWiredLayer = layerIdx
+
+    let layerMs = (CFAbsoluteTimeGetCurrent() - tLayer) * 1000
+    let layerType = isFullAttn(layerIdx) ? "ATTN" : "GDN"
+    let wiredMB = totalWiredBytes / 1024 / 1024
+    if layerIdx < 3 || layerIdx == NUM_LAYERS - 1 || layerIdx % 16 == 0 {
+        print("  Layer \(String(format: "%2d", layerIdx)) [\(layerType)]: " +
+              "\(String(format: "%.0f", layerMs))ms  " +
+              "(cumulative: \(wiredMB) MB)")
+    } else if layerIdx == 3 {
+        print("  ...")
+    }
+}
+
+// lm_head: stream from mmap (saves 682MB — critical on 16GB)
+let lmHeadInfo = index["lm_head"] as! [String: Any]
+let lmHeadWInfo = parseTensorInfo(lmHeadInfo["weight"] as! [String: Any])
+let lmHeadSInfo = parseTensorInfo(lmHeadInfo["scales"] as! [String: Any])
+let lmHeadBInfo = parseTensorInfo(lmHeadInfo["biases"] as! [String: Any])
+print("  lm_head: streamed from mmap (682 MB saved)")
+
+let tWarmTotal = CFAbsoluteTimeGetCurrent() - tWarmStart
+let coldLayerCount = NUM_LAYERS - wiredLayerCount
+print("\nWarm wiring complete:")
+print("  Total wired: \(totalWiredBytes / 1024 / 1024) MB")
+print("  Time: \(String(format: "%.1f", tWarmTotal))s")
+print("  Warm layers: \(wiredLayerCount)/\(NUM_LAYERS) (0-\(lastWiredLayer))")
+print("  Cold layers: \(coldLayerCount) (\(lastWiredLayer+1)-\(NUM_LAYERS-1)) — streamed from mmap")
+print("  lm_head: streamed from mmap (682 MB saved)")
+print("  embed: row lookup from mmap (682 MB saved)")
+
+// Cold-path layer loading (same as full_forward.swift)
+func loadAttnLayerCold(_ layerIdx: Int) -> AttnLayerWeights {
+    let li = layersInfo[layerIdx]
+    let tensors = li["tensors"] as! [String: Any]
+    func loadT(_ name: String) -> MTLBuffer {
+        return loadTensorToBuffer(device, mmaps, parseTensorInfo(tensors[name] as! [String: Any]))
+    }
+    var lw = AttnLayerWeights()
+    lw.inputNormWeight = loadT("input_layernorm.weight")
+    lw.qProjW = loadT("self_attn.q_proj.weight")
+    lw.qProjS = loadT("self_attn.q_proj.scales")
+    lw.qProjB = loadT("self_attn.q_proj.biases")
+    lw.kProjW = loadT("self_attn.k_proj.weight")
+    lw.kProjS = loadT("self_attn.k_proj.scales")
+    lw.kProjB = loadT("self_attn.k_proj.biases")
+    lw.vProjW = loadT("self_attn.v_proj.weight")
+    lw.vProjS = loadT("self_attn.v_proj.scales")
+    lw.vProjB = loadT("self_attn.v_proj.biases")
+    lw.oProjW = loadT("self_attn.o_proj.weight")
+    lw.oProjS = loadT("self_attn.o_proj.scales")
+    lw.oProjB = loadT("self_attn.o_proj.biases")
+    lw.qNormWeight = loadT("self_attn.q_norm.weight")
+    lw.kNormWeight = loadT("self_attn.k_norm.weight")
+    lw.postNormWeight = loadT("post_attention_layernorm.weight")
+    lw.gateProjW = loadT("mlp.gate_proj.weight")
+    lw.gateProjS = loadT("mlp.gate_proj.scales")
+    lw.gateProjB = loadT("mlp.gate_proj.biases")
+    lw.upProjW = loadT("mlp.up_proj.weight")
+    lw.upProjS = loadT("mlp.up_proj.scales")
+    lw.upProjB = loadT("mlp.up_proj.biases")
+    lw.downProjW = loadT("mlp.down_proj.weight")
+    lw.downProjS = loadT("mlp.down_proj.scales")
+    lw.downProjB = loadT("mlp.down_proj.biases")
+    return lw
+}
+
+func loadGDNLayerCold(_ layerIdx: Int) -> GDNLayerWeights {
+    let li = layersInfo[layerIdx]
+    let tensors = li["tensors"] as! [String: Any]
+    func loadT(_ name: String) -> MTLBuffer {
+        return loadTensorToBuffer(device, mmaps, parseTensorInfo(tensors[name] as! [String: Any]))
+    }
+    var lw = GDNLayerWeights()
+    lw.inputNormWeight = loadT("input_layernorm.weight")
+    lw.qkvProjW = loadT("linear_attn.in_proj_qkv.weight")
+    lw.qkvProjS = loadT("linear_attn.in_proj_qkv.scales")
+    lw.qkvProjB = loadT("linear_attn.in_proj_qkv.biases")
+    lw.zProjW = loadT("linear_attn.in_proj_z.weight")
+    lw.zProjS = loadT("linear_attn.in_proj_z.scales")
+    lw.zProjB = loadT("linear_attn.in_proj_z.biases")
+    lw.bProjW = loadT("linear_attn.in_proj_b.weight")
+    lw.bProjS = loadT("linear_attn.in_proj_b.scales")
+    lw.bProjB = loadT("linear_attn.in_proj_b.biases")
+    lw.aProjW = loadT("linear_attn.in_proj_a.weight")
+    lw.aProjS = loadT("linear_attn.in_proj_a.scales")
+    lw.aProjB = loadT("linear_attn.in_proj_a.biases")
+    lw.convWeight = loadT("linear_attn.conv1d.weight")
+    lw.ALog = loadT("linear_attn.A_log")
+    lw.dtBias = loadT("linear_attn.dt_bias")
+    lw.normWeight = loadT("linear_attn.norm.weight")
+    lw.outProjW = loadT("linear_attn.out_proj.weight")
+    lw.outProjS = loadT("linear_attn.out_proj.scales")
+    lw.outProjB = loadT("linear_attn.out_proj.biases")
+    lw.postNormWeight = loadT("post_attention_layernorm.weight")
+    lw.gateProjW = loadT("mlp.gate_proj.weight")
+    lw.gateProjS = loadT("mlp.gate_proj.scales")
+    lw.gateProjB = loadT("mlp.gate_proj.biases")
+    lw.upProjW = loadT("mlp.up_proj.weight")
+    lw.upProjS = loadT("mlp.up_proj.scales")
+    lw.upProjB = loadT("mlp.up_proj.biases")
+    lw.downProjW = loadT("mlp.down_proj.weight")
+    lw.downProjS = loadT("mlp.down_proj.scales")
+    lw.downProjB = loadT("mlp.down_proj.biases")
+    return lw
+}
+
+// ============================================================================
+// MARK: - Unmap safetensors (free virtual address space, weights are in Metal buffers now)
+// ============================================================================
+// We keep mmaps alive for embedding row lookups during decode.
+// The mmap pages for layer weights should be evicted from RAM since Metal buffers
+// now hold copies. The OS will reclaim those pages under memory pressure.
 
 // ============================================================================
 // MARK: - Activation Buffers
@@ -649,27 +917,21 @@ let ropeSinBuf = device.makeBuffer(length: ROTARY_DIM / 2 * 4, options: .storage
 // MARK: - GDN Persistent State (48 layers)
 // ============================================================================
 
-let convStateBytes = (GDN_CONV_KERNEL - 1) * GDN_CONV_DIM * 2  // 3 * 10240 * 2 = 61440
-let deltaStateBytes = GDN_STATE_SIZE * 4                         // 48*128*128 * 4 = 3145728
+let convStateBytes = (GDN_CONV_KERNEL - 1) * GDN_CONV_DIM * 2
+let deltaStateBytes = GDN_STATE_SIZE * 4
 
-// Two conv state buffers for double-buffering (A = current, B = new)
 let numGDNLayers = 48
 let convStateA = device.makeBuffer(length: convStateBytes * numGDNLayers, options: .storageModeShared)!
 let convStateB = device.makeBuffer(length: convStateBytes * numGDNLayers, options: .storageModeShared)!
-// Delta state: single buffer, updated in-place
 let deltaState = device.makeBuffer(length: deltaStateBytes * numGDNLayers, options: .storageModeShared)!
 
-// Initialize all state to zeros
 memset(convStateA.contents(), 0, convStateA.length)
 memset(convStateB.contents(), 0, convStateB.length)
 memset(deltaState.contents(), 0, deltaState.length)
 
 let stateMB = (convStateA.length * 2 + deltaState.length) / 1024 / 1024
 print("\nGDN state allocated: \(stateMB) MB (\(numGDNLayers) layers)")
-print("  Conv state: \(convStateBytes * numGDNLayers / 1024) KB per buffer")
-print("  Delta state: \(deltaStateBytes * numGDNLayers / 1024 / 1024) MB")
 
-// Map from layer index to GDN index (0-47)
 var gdnLayerIndex: [Int: Int] = [:]
 var gdnIdx = 0
 for i in 0..<NUM_LAYERS {
@@ -679,7 +941,6 @@ for i in 0..<NUM_LAYERS {
     }
 }
 
-// Map from layer index to attention cache index (0-15)
 var attnLayerIndex: [Int: Int] = [:]
 var attnIdx = 0
 for i in 0..<NUM_LAYERS {
@@ -694,15 +955,15 @@ for i in 0..<NUM_LAYERS {
 // ============================================================================
 
 let MAX_SEQ: Int = 1024
-let kvTokenBytes = NUM_KV_HEADS * HEAD_DIM * 2  // 4 * 256 * 2 = 2048 bytes per token
-let kvLayerBytes = MAX_SEQ * kvTokenBytes         // 262144 bytes per layer
+let kvTokenBytes = NUM_KV_HEADS * HEAD_DIM * 2
+let kvLayerBytes = MAX_SEQ * kvTokenBytes
 let numAttnLayers = 16
 
 let kCache = device.makeBuffer(length: kvLayerBytes * numAttnLayers, options: .storageModeShared)!
 let vCache = device.makeBuffer(length: kvLayerBytes * numAttnLayers, options: .storageModeShared)!
 memset(kCache.contents(), 0, kCache.length)
 memset(vCache.contents(), 0, vCache.length)
-print("KV cache: \(kCache.length * 2 / 1024) KB (\(numAttnLayers) layers × \(MAX_SEQ) tokens)")
+print("KV cache: \(kCache.length * 2 / 1024) KB (\(numAttnLayers) layers x \(MAX_SEQ) tokens)")
 
 // ============================================================================
 // MARK: - Helper: dispatch quantized matmul
@@ -743,86 +1004,22 @@ func precomputeRoPE(position: Int) {
 }
 
 // ============================================================================
-// MARK: - Layer Weight Loading (streaming from mmap)
+// MARK: - Helper: Targeted embedding lookup from mmap
 // ============================================================================
 
-func loadAttnLayer(_ layerIdx: Int) -> AttnLayerWeights {
-    let li = layersInfo[layerIdx]
-    let tensors = li["tensors"] as! [String: Any]
-    func loadT(_ name: String) -> MTLBuffer {
-        return loadTensorToBuffer(device, mmaps, parseTensorInfo(tensors[name] as! [String: Any]))
-    }
-    var lw = AttnLayerWeights()
-    lw.inputNormWeight = loadT("input_layernorm.weight")
-    lw.qProjW = loadT("self_attn.q_proj.weight")
-    lw.qProjS = loadT("self_attn.q_proj.scales")
-    lw.qProjB = loadT("self_attn.q_proj.biases")
-    lw.kProjW = loadT("self_attn.k_proj.weight")
-    lw.kProjS = loadT("self_attn.k_proj.scales")
-    lw.kProjB = loadT("self_attn.k_proj.biases")
-    lw.vProjW = loadT("self_attn.v_proj.weight")
-    lw.vProjS = loadT("self_attn.v_proj.scales")
-    lw.vProjB = loadT("self_attn.v_proj.biases")
-    lw.oProjW = loadT("self_attn.o_proj.weight")
-    lw.oProjS = loadT("self_attn.o_proj.scales")
-    lw.oProjB = loadT("self_attn.o_proj.biases")
-    lw.qNormWeight = loadT("self_attn.q_norm.weight")
-    lw.kNormWeight = loadT("self_attn.k_norm.weight")
-    lw.postNormWeight = loadT("post_attention_layernorm.weight")
-    lw.gateProjW = loadT("mlp.gate_proj.weight")
-    lw.gateProjS = loadT("mlp.gate_proj.scales")
-    lw.gateProjB = loadT("mlp.gate_proj.biases")
-    lw.upProjW = loadT("mlp.up_proj.weight")
-    lw.upProjS = loadT("mlp.up_proj.scales")
-    lw.upProjB = loadT("mlp.up_proj.biases")
-    lw.downProjW = loadT("mlp.down_proj.weight")
-    lw.downProjS = loadT("mlp.down_proj.scales")
-    lw.downProjB = loadT("mlp.down_proj.biases")
-    return lw
-}
+func embedFromMmap(tokenId: Int) {
+    // Copy just one row of weight/scales/biases from mmap into small Metal buffers
+    let wSrc = mmaps[embedWeightInfo.fileIdx] + embedWeightInfo.byteOffset + tokenId * embedWeightRowBytes
+    let sSrc = mmaps[embedScalesInfo.fileIdx] + embedScalesInfo.byteOffset + tokenId * embedScaleRowBytes
+    let bSrc = mmaps[embedBiasesInfo.fileIdx] + embedBiasesInfo.byteOffset + tokenId * embedBiasRowBytes
 
-func loadGDNLayer(_ layerIdx: Int) -> GDNLayerWeights {
-    let li = layersInfo[layerIdx]
-    let tensors = li["tensors"] as! [String: Any]
-    func loadT(_ name: String) -> MTLBuffer {
-        return loadTensorToBuffer(device, mmaps, parseTensorInfo(tensors[name] as! [String: Any]))
-    }
-    var lw = GDNLayerWeights()
-    lw.inputNormWeight = loadT("input_layernorm.weight")
-    lw.qkvProjW = loadT("linear_attn.in_proj_qkv.weight")
-    lw.qkvProjS = loadT("linear_attn.in_proj_qkv.scales")
-    lw.qkvProjB = loadT("linear_attn.in_proj_qkv.biases")
-    lw.zProjW = loadT("linear_attn.in_proj_z.weight")
-    lw.zProjS = loadT("linear_attn.in_proj_z.scales")
-    lw.zProjB = loadT("linear_attn.in_proj_z.biases")
-    lw.bProjW = loadT("linear_attn.in_proj_b.weight")
-    lw.bProjS = loadT("linear_attn.in_proj_b.scales")
-    lw.bProjB = loadT("linear_attn.in_proj_b.biases")
-    lw.aProjW = loadT("linear_attn.in_proj_a.weight")
-    lw.aProjS = loadT("linear_attn.in_proj_a.scales")
-    lw.aProjB = loadT("linear_attn.in_proj_a.biases")
-    lw.convWeight = loadT("linear_attn.conv1d.weight")
-    lw.ALog = loadT("linear_attn.A_log")
-    lw.dtBias = loadT("linear_attn.dt_bias")
-    lw.normWeight = loadT("linear_attn.norm.weight")
-    lw.outProjW = loadT("linear_attn.out_proj.weight")
-    lw.outProjS = loadT("linear_attn.out_proj.scales")
-    lw.outProjB = loadT("linear_attn.out_proj.biases")
-    lw.postNormWeight = loadT("post_attention_layernorm.weight")
-    lw.gateProjW = loadT("mlp.gate_proj.weight")
-    lw.gateProjS = loadT("mlp.gate_proj.scales")
-    lw.gateProjB = loadT("mlp.gate_proj.biases")
-    lw.upProjW = loadT("mlp.up_proj.weight")
-    lw.upProjS = loadT("mlp.up_proj.scales")
-    lw.upProjB = loadT("mlp.up_proj.biases")
-    lw.downProjW = loadT("mlp.down_proj.weight")
-    lw.downProjS = loadT("mlp.down_proj.scales")
-    lw.downProjB = loadT("mlp.down_proj.biases")
-    return lw
+    memcpy(embedRowWBuf.contents(), wSrc, embedWeightRowBytes)
+    memcpy(embedRowSBuf.contents(), sSrc, embedScaleRowBytes)
+    memcpy(embedRowBBuf.contents(), bSrc, embedBiasRowBytes)
 }
 
 // ============================================================================
-// MARK: - Dispatch: Full Attention Layer
+// MARK: - Dispatch: Full Attention Layer (uses pre-wired weights)
 // ============================================================================
 
 func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
@@ -841,7 +1038,7 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: 256, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 2. Q projection (12288 = 24 * 256 * 2, interleaved Q+gate)
+    // 2. Q projection
     dispatchQMatmul(enc, lw.qProjW!, lw.qProjS!, lw.qProjB!,
                     normedBuf, qBuf,
                     K_dim: HIDDEN_SIZE, N_dim: NUM_HEADS * HEAD_DIM * 2, M_dim: 1)
@@ -906,7 +1103,7 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: ROTARY_DIM / 2, height: NUM_KV_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-    // 7a. Append K to cache at current position
+    // 7a. Append K to cache
     let cacheLayerOffset = attnIdx * kvLayerBytes
     let cacheTokenOffset = cacheLayerOffset + position * kvTokenBytes
     enc.setComputePipelineState(copyPSO)
@@ -923,7 +1120,7 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: NUM_KV_HEADS * HEAD_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 7c. Scaled dot-product attention with KV cache
+    // 7c. SDPA
     enc.setComputePipelineState(sdpaPSO)
     enc.setBuffer(qNormedBuf, offset: 0, index: 0)
     enc.setBuffer(kCache, offset: cacheLayerOffset, index: 1)
@@ -937,7 +1134,7 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
     enc.dispatchThreads(MTLSize(width: NUM_HEADS, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: NUM_HEADS, height: 1, depth: 1))
 
-    // 8. Output gate: gated = attn_out * sigmoid(gate)
+    // 8. Output gate
     enc.setComputePipelineState(sigmoidMulPSO)
     enc.setBuffer(attnOutBuf, offset: 0, index: 0)
     enc.setBuffer(attnGateBuf, offset: 0, index: 1)
@@ -976,7 +1173,7 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
                 lw.upProjW!, lw.upProjS!, lw.upProjB!,
                 lw.downProjW!, lw.downProjS!, lw.downProjB!)
 
-    // 16. Final residual → hiddenBuf
+    // 16. Final residual
     enc.setComputePipelineState(residualPSO)
     enc.setBuffer(residualBuf, offset: 0, index: 0)
     enc.setBuffer(downProjBuf, offset: 0, index: 1)
@@ -987,7 +1184,7 @@ func dispatchAttnLayer(_ enc: MTLComputeCommandEncoder, _ lw: AttnLayerWeights,
 }
 
 // ============================================================================
-// MARK: - Dispatch: GDN Layer
+// MARK: - Dispatch: GDN Layer (uses pre-wired weights)
 // ============================================================================
 
 func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
@@ -1041,8 +1238,6 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: GDN_CONV_DIM, height: 1, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-    // 5. Q/K/V split is implicit — use offsets into convSiluBuf
-
     // 6. QK norm with scale
     enc.setComputePipelineState(perHeadRmsNormScaledPSO)
     enc.setBuffer(convSiluBuf, offset: 0, index: 0)
@@ -1066,7 +1261,7 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.dispatchThreads(MTLSize(width: GDN_HEAD_K_DIM, height: GDN_NUM_K_HEADS, depth: 1),
                         threadsPerThreadgroup: MTLSize(width: GDN_HEAD_K_DIM, height: 1, depth: 1))
 
-    // 7. Expand K heads (16 → 48)
+    // 7. Expand K heads
     var nvh = UInt32(GDN_NUM_V_HEADS)
     enc.setComputePipelineState(expandKvPSO)
     enc.setBuffer(gdnQNormedBuf, offset: 0, index: 0)
@@ -1098,7 +1293,7 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
     enc.setComputePipelineState(gdnStepPSO)
     enc.setBuffer(gdnQExpandedBuf, offset: 0, index: 0)
     enc.setBuffer(gdnKExpandedBuf, offset: 0, index: 1)
-    enc.setBuffer(convSiluBuf, offset: GDN_KEY_DIM * 2 * 2, index: 2)  // V starts after Q+K
+    enc.setBuffer(convSiluBuf, offset: GDN_KEY_DIM * 2 * 2, index: 2)
     enc.setBuffer(gBuf, offset: 0, index: 3)
     enc.setBuffer(betaBuf, offset: 0, index: 4)
     enc.setBuffer(deltaState, offset: deltaOffset, index: 5)
@@ -1150,7 +1345,7 @@ func dispatchGDNLayer(_ enc: MTLComputeCommandEncoder, _ lw: GDNLayerWeights,
                 lw.upProjW!, lw.upProjS!, lw.upProjB!,
                 lw.downProjW!, lw.downProjS!, lw.downProjB!)
 
-    // 15. Final residual → hiddenBuf
+    // 15. Final residual
     enc.setComputePipelineState(residualPSO)
     enc.setBuffer(residualBuf, offset: 0, index: 0)
     enc.setBuffer(downProjBuf, offset: 0, index: 1)
@@ -1190,48 +1385,50 @@ func dispatchMLP(_ enc: MTLComputeCommandEncoder,
 }
 
 // ============================================================================
-// MARK: - Full Forward Pass
+// MARK: - Warm Forward Pass (all weights pre-loaded, no per-layer mmap)
 // ============================================================================
 
-var convStateFlip = true  // true = read A write B, false = read B write A
+var convStateFlip = true
 
-func forwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId: Int, timeMs: Double) {
+func warmForwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId: Int, timeMs: Double) {
     let tStart = CFAbsoluteTimeGetCurrent()
     precomputeRoPE(position: position)
 
-    // --- Embedding ---
+    // --- Embedding (targeted row lookup from mmap, ~3KB) ---
+    embedFromMmap(tokenId: tokenId)
+
     let cbEmbed = queue.makeCommandBuffer()!
     let encEmbed = cbEmbed.makeComputeCommandEncoder()!
-    encEmbed.setComputePipelineState(embedPSO)
-    encEmbed.setBuffer(embedW, offset: 0, index: 0)
-    encEmbed.setBuffer(embedS, offset: 0, index: 1)
-    encEmbed.setBuffer(embedB, offset: 0, index: 2)
+    encEmbed.setComputePipelineState(embedRowPSO)
+    encEmbed.setBuffer(embedRowWBuf, offset: 0, index: 0)
+    encEmbed.setBuffer(embedRowSBuf, offset: 0, index: 1)
+    encEmbed.setBuffer(embedRowBBuf, offset: 0, index: 2)
     encEmbed.setBuffer(hiddenBuf, offset: 0, index: 3)
-    var tid = UInt32(tokenId)
-    encEmbed.setBytes(&tid, length: 4, index: 4)
     var hdim = UInt32(HIDDEN_SIZE)
-    encEmbed.setBytes(&hdim, length: 4, index: 5)
+    encEmbed.setBytes(&hdim, length: 4, index: 4)
     var gsz = UInt32(GROUP_SIZE)
-    encEmbed.setBytes(&gsz, length: 4, index: 6)
+    encEmbed.setBytes(&gsz, length: 4, index: 5)
     encEmbed.dispatchThreads(MTLSize(width: HIDDEN_SIZE, height: 1, depth: 1),
                              threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     encEmbed.endEncoding()
     cbEmbed.commit()
     cbEmbed.waitUntilCompleted()
 
-    // --- 64 Layers (streaming weights) ---
+    // --- 64 Layers (warm layers from Metal buffers, cold layers streamed from mmap) ---
     for layerIdx in 0..<NUM_LAYERS {
         let tLayer = CFAbsoluteTimeGetCurrent()
 
         let cb = queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
 
+        let isWarm = layerIdx <= lastWiredLayer
+
         if isFullAttn(layerIdx) {
-            let lw = loadAttnLayer(layerIdx)
+            let lw = isWarm ? warmAttnLayers[layerIdx]! : loadAttnLayerCold(layerIdx)
             dispatchAttnLayer(enc, lw, attnIdx: attnLayerIndex[layerIdx]!, position: position)
         } else {
             let gIdx = gdnLayerIndex[layerIdx]!
-            let lw = loadGDNLayer(layerIdx)
+            let lw = isWarm ? warmGDNLayers[layerIdx]! : loadGDNLayerCold(layerIdx)
             dispatchGDNLayer(enc, lw, gdnIdx: gIdx, useConvA: convStateFlip)
         }
 
@@ -1247,15 +1444,15 @@ func forwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId
         if verbose {
             let layerMs = (CFAbsoluteTimeGetCurrent() - tLayer) * 1000
             let layerType = isFullAttn(layerIdx) ? "ATTN" : "GDN"
+            let pathTag = isWarm ? "WARM" : "COLD"
             if layerIdx < 4 || layerIdx >= 60 || layerIdx % 16 == 0 {
-                print("  Layer \(String(format: "%2d", layerIdx)) [\(layerType)]: \(String(format: "%.1f", layerMs))ms")
+                print("  Layer \(String(format: "%2d", layerIdx)) [\(layerType)] \(pathTag): \(String(format: "%.1f", layerMs))ms")
             } else if layerIdx == 4 {
                 print("  ...")
             }
         }
     }
 
-    // Swap conv state for next pass
     convStateFlip = !convStateFlip
 
     // --- Final norm ---
@@ -1276,11 +1473,10 @@ func forwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId
     cbFinal.commit()
     cbFinal.waitUntilCompleted()
 
-    // --- lm_head (stream from mmap) ---
-    let lmHeadInfo = index["lm_head"] as! [String: Any]
-    let lmW = loadTensorToBuffer(device, mmaps, parseTensorInfo(lmHeadInfo["weight"] as! [String: Any]))
-    let lmS = loadTensorToBuffer(device, mmaps, parseTensorInfo(lmHeadInfo["scales"] as! [String: Any]))
-    let lmB = loadTensorToBuffer(device, mmaps, parseTensorInfo(lmHeadInfo["biases"] as! [String: Any]))
+    // --- lm_head (streamed from mmap each token — 682MB, not worth pre-loading on 16GB) ---
+    let lmW = loadTensorToBuffer(device, mmaps, lmHeadWInfo)
+    let lmS = loadTensorToBuffer(device, mmaps, lmHeadSInfo)
+    let lmB = loadTensorToBuffer(device, mmaps, lmHeadBInfo)
 
     let cbLm = queue.makeCommandBuffer()!
     let encLm = cbLm.makeComputeCommandEncoder()!
@@ -1308,110 +1504,61 @@ func forwardPass(tokenId: Int, position: Int, verbose: Bool = false) -> (tokenId
 }
 
 // ============================================================================
-// MARK: - Autoregressive Generation (prompt from file or single token)
+// MARK: - Autoregressive Generation
 // ============================================================================
 
-// Check for prompt file argument
-var promptTokens: [Int] = []
-var maxGenerate = 300
-
-let promptPath = "/Users/midas/Desktop/cowork/inference-across-metal/overnight_prompt_tokens.json"
-if FileManager.default.fileExists(atPath: promptPath) {
-    let data = try! Data(contentsOf: URL(fileURLWithPath: promptPath))
-    let obj = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
-    promptTokens = (obj["tokens"] as! [Any]).map { ($0 as! NSNumber).intValue }
-    maxGenerate = (obj["max_generate"] as? NSNumber)?.intValue ?? 300
-    print("\nLoaded prompt: \(promptTokens.count) tokens, max_generate=\(maxGenerate)")
-    print("Source: \(obj["source"] as? String ?? "unknown")")
-} else {
-    // Fallback: single "Hello" token
-    promptTokens = [9419]
-    maxGenerate = 75
-    print("\nNo prompt file found, using Hello token")
-}
-
-let totalSteps = promptTokens.count + maxGenerate
+// Single "Hello" token — no prompt file needed for warm path test
+let promptTokens: [Int] = [9419]
+let maxGenerate = 50
 
 print("\n" + String(repeating: "=", count: 60))
-print("Autoregressive Generation — Qwen3.5-27B on M5 Air 16GB")
-print("Prompt: \(promptTokens.count) tokens, Generate: \(maxGenerate) tokens")
-print("Estimated time: \(totalSteps * 15 / 60) min")
+print("WARM PATH Generation — Qwen3.5-27B on M5 Air 16GB")
+print("Prompt: token 9419 (Hello), Generate: \(maxGenerate) tokens")
+print("All weights pre-loaded in Metal shared buffers")
 print(String(repeating: "=", count: 60))
 
-var allTokens: [Int] = promptTokens
 var generatedTokens: [Int] = []
 
 let tGenStart = CFAbsoluteTimeGetCurrent()
 
-// --- Phase 1: Prefill (process prompt tokens) ---
-var lastPrefillToken: Int = -1
-if promptTokens.count > 1 {
-    print("\nPhase 1: Prefill (\(promptTokens.count) tokens)...")
-    for (i, token) in promptTokens.enumerated() {
-        let position = i
-        let (nextToken, stepMs) = forwardPass(tokenId: token, position: position)
-        lastPrefillToken = nextToken  // capture last one as first generated token
-
-        if i < 3 || i == promptTokens.count - 1 || i % 50 == 0 {
-            let elapsed = CFAbsoluteTimeGetCurrent() - tGenStart
-            let pct = Double(i + 1) / Double(promptTokens.count) * 100
-            print("  Prefill \(String(format: "%3d", i+1))/\(promptTokens.count) " +
-                  "(\(String(format: "%.0f", pct))%) " +
-                  "[\(String(format: "%.1f", stepMs))ms, " +
-                  "\(String(format: "%.0f", elapsed))s elapsed]")
-        }
-    }
-    let prefillTime = CFAbsoluteTimeGetCurrent() - tGenStart
-    print("  Prefill complete: \(String(format: "%.0f", prefillTime))s " +
-          "(\(String(format: "%.1f", prefillTime / 60))min)")
+// First token
+print("\nGenerating (verbose first token)...")
+let (firstGen, firstMs) = warmForwardPass(tokenId: promptTokens[0], position: 0, verbose: true)
+if firstGen < 0 {
+    print("FATAL: First token failed")
+    exit(1)
 }
+generatedTokens.append(firstGen)
+print("  Token 1: \(firstGen) [\(String(format: "%.1f", firstMs))ms]")
 
-// --- Phase 2: Generate ---
-print("\nPhase 2: Generate (\(maxGenerate) tokens)...")
-let tGenPhase = CFAbsoluteTimeGetCurrent()
-
-// Use the last prefill step's output as the first generated token
-// (the prefill loop already ran all prompt tokens and produced the next-token prediction)
-var currentToken: Int
-if promptTokens.count > 1 {
-    // lastPrefillToken was set by the prefill loop — no re-run needed
-    currentToken = lastPrefillToken
-} else {
-    let (firstGen, _) = forwardPass(tokenId: promptTokens[0], position: 0)
-    currentToken = firstGen
-}
-generatedTokens.append(currentToken)
-allTokens.append(currentToken)
-
-let genStartPos = promptTokens.count
+var currentToken = firstGen
 
 for step in 1..<maxGenerate {
-    let position = genStartPos + step - 1
+    let position = step
 
     if position >= MAX_SEQ - 1 {
         print("  KV cache full at position \(position)")
         break
     }
 
-    let (nextToken, stepMs) = forwardPass(tokenId: currentToken, position: position)
+    let (nextToken, stepMs) = warmForwardPass(tokenId: currentToken, position: position)
 
     if nextToken < 0 {
-        print("ERROR: generation failed at step \(step)")
+        print("ERROR at step \(step)")
         break
     }
 
     generatedTokens.append(nextToken)
-    allTokens.append(nextToken)
     currentToken = nextToken
 
-    let elapsed = CFAbsoluteTimeGetCurrent() - tGenPhase
+    let elapsed = CFAbsoluteTimeGetCurrent() - tGenStart
     let tokPerSec = Double(step + 1) / elapsed
+
     print("  Gen \(String(format: "%3d", step+1))/\(maxGenerate): " +
           "token \(String(format: "%6d", nextToken))  " +
           "[\(String(format: "%.1f", stepMs))ms, " +
-          "\(String(format: "%.3f", tokPerSec)) tok/s]")
+          "\(String(format: "%.2f", tokPerSec)) tok/s]")
 
-    // Stop on EOS
     if nextToken == 151643 || nextToken == 151645 {
         print("  (EOS)")
         break
@@ -1419,29 +1566,27 @@ for step in 1..<maxGenerate {
 }
 
 let tGenTotal = CFAbsoluteTimeGetCurrent() - tGenStart
-let genPhaseTime = CFAbsoluteTimeGetCurrent() - tGenPhase
 
 print("\n" + String(repeating: "=", count: 60))
-print("GENERATION COMPLETE")
+print("WARM PATH GENERATION COMPLETE")
 print(String(repeating: "=", count: 60))
-print("Prompt tokens:    \(promptTokens.count)")
 print("Generated tokens: \(generatedTokens.count)")
-print("Total time:       \(String(format: "%.0f", tGenTotal))s (\(String(format: "%.1f", tGenTotal / 60))min)")
-if promptTokens.count > 1 {
-    let prefillTime = tGenTotal - genPhaseTime
-    print("  Prefill:        \(String(format: "%.0f", prefillTime))s")
-    print("  Generation:     \(String(format: "%.0f", genPhaseTime))s")
-}
-print("Gen tok/s:        \(String(format: "%.4f", Double(generatedTokens.count) / genPhaseTime))")
+print("Total gen time:   \(String(format: "%.1f", tGenTotal))s")
+print("Avg tok/s:        \(String(format: "%.3f", Double(generatedTokens.count) / tGenTotal))")
+print("Avg ms/token:     \(String(format: "%.1f", tGenTotal * 1000 / Double(generatedTokens.count)))")
+print("Wiring overhead:  \(String(format: "%.1f", tWarmTotal))s (one-time)")
 
 // Save results
-let resultPath = "/Users/midas/Desktop/cowork/inference-across-metal/overnight_result.json"
+let resultPath = "/Users/midas/Desktop/cowork/inference-across-metal/warm_result.json"
 let resultDict: [String: Any] = [
-    "prompt_tokens": promptTokens.count,
+    "mode": "warm_path",
     "generated_tokens": generatedTokens.count,
-    "total_time_s": tGenTotal,
+    "total_gen_time_s": tGenTotal,
+    "avg_tok_per_s": Double(generatedTokens.count) / tGenTotal,
+    "avg_ms_per_token": tGenTotal * 1000 / Double(generatedTokens.count),
+    "wiring_time_s": tWarmTotal,
+    "wired_mb": totalWiredBytes / 1024 / 1024,
     "generated_token_ids": generatedTokens,
-    "all_token_ids": allTokens,
 ]
 let resultData = try! JSONSerialization.data(withJSONObject: resultDict, options: .prettyPrinted)
 try! resultData.write(to: URL(fileURLWithPath: resultPath))

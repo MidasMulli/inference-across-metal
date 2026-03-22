@@ -15,6 +15,8 @@ streaming_27b
 weight_loader
 weight_loader_aligned
 zero_copy_27b
+warm_forward
+test_context
 
 # Reference data (large binary files)
 reference_data/
@@ -23,6 +25,8 @@ reference_data/
 overnight_output.log
 overnight_result.json
 overnight_prompt_tokens.json
+context_test_output.log
+context_test_results.json
 
 # macOS
 .DS_Store
