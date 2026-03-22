@@ -1,5 +1,9 @@
 # Compiled Swift binaries
+attn_forward
 batch_verify_27b
+challenge_plateau
+full_forward
+gdn_forward
 kernel_both
 kernel_dispatch
 kernel_f32
@@ -10,9 +14,14 @@ mlp_pipeline
 streaming_27b
 weight_loader
 weight_loader_aligned
+zero_copy_27b
 
 # Reference data (large binary files)
 reference_data/
+
+# Overnight run output (regenerable)
+overnight_output.log
+overnight_result.json
 
 # macOS
 .DS_Store
