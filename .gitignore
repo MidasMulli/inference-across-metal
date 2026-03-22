@@ -1,0 +1,18 @@
+# Compiled Swift binaries
+batch_verify_27b
+kernel_both
+kernel_dispatch
+kernel_f32
+kernel_minimal
+kernel_setbytes
+main
+mlp_pipeline
+streaming_27b
+weight_loader
+weight_loader_aligned
+
+# Reference data (large binary files)
+reference_data/
+
+# macOS
+.DS_Store
