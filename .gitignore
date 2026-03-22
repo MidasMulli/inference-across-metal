@@ -22,6 +22,7 @@ reference_data/
 # Overnight run output (regenerable)
 overnight_output.log
 overnight_result.json
+overnight_prompt_tokens.json
 
 # macOS
 .DS_Store
