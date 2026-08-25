@@ -98,7 +98,7 @@ We audited MLX 0.31.1's Steel kernels -- they use cooperative tensors (`MetalPer
 
 ## GDN (GatedDeltaNet) Implementation
 
-48 of 64 layers use GatedDeltaNet -- a linear attention variant with persistent recurrent state. This is, to our knowledge, the first standalone Swift/Metal GDN streaming implementation outside the MLX runtime (MLX ships a hand-written GatedDeltaNet Metal kernel, gated_delta.py).
+48 of 64 layers use GatedDeltaNet -- a linear attention variant with persistent recurrent state. This is a standalone Swift/Metal GDN streaming implementation independent of the MLX runtime (MLX ships a hand-written GatedDeltaNet Metal kernel, gated_delta.py).
 
 - **Conv1d state**: depthwise convolution with kernel=4, double-buffered across tokens. 10240-dim input, stored per layer.
 - **Delta state**: 48 layers x 48 heads x 128x128 float32 matrices. Rank-1 update recurrence per token (`S = alpha * S + beta * k * v^T`).
